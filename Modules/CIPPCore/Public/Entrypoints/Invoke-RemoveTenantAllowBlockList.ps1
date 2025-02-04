@@ -22,7 +22,7 @@ Function Invoke-RemoveTenantAllowBlockList {
             cmdParams = @{
                 Entries     = [string[]]$Request.query.entries
                 ListType    = [string]$Request.query.listType
-                ListSubType = 'Tenant'
+                ListSubType = [string]$Request.query.listSubType
             }
         }
 
