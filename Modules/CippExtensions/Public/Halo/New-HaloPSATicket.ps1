@@ -67,6 +67,7 @@ function New-HaloPSATicket {
         donotapplytemplateintheapi = $true
         attachments                = @()
         _novalidate                = $true
+        source                     = 16 ## ISGQ-specific, sets source of ticket as CIPP in HaloPSA
     }
 
     if ($Configuration.TicketType) {
