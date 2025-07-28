@@ -20,8 +20,9 @@ function New-HaloPSATicket {
 
             $Ticket = Invoke-RestMethod -Uri "$($Configuration.ResourceURL)/Tickets/$($ExistingTicket.TicketID)?includedetails=true&includelastaction=false&nocache=undefined&includeusersassets=false&isdetailscreen=true" -ContentType 'application/json; charset=utf-8' -Method Get -Headers @{Authorization = "Bearer $($token.access_token)" }
             if (!$Ticket.hasbeenclosed) {
-                Write-Information 'Ticket is still open, adding new note'
-                $Object = [PSCustomObject]@{
+                Write-Information "Ticket is still open"
+                return "Ticket is still open"
+                <#$Object = [PSCustomObject]@{
                     ticket_id      = $ExistingTicket.TicketID
                     outcome        = 'Private Note'
                     outcome_id     = 7
@@ -45,7 +46,7 @@ function New-HaloPSATicket {
                     Write-Information "Failed to add note to HaloPSA ticket: $Message"
                     Write-Information "Body we tried to ship: $body"
                     return "Failed to add note to HaloPSA ticket: $Message"
-                }
+                }#>
             }
         }
     }
