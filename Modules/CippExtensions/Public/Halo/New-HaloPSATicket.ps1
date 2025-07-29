@@ -6,7 +6,6 @@ function New-HaloPSATicket {
         $client
     )
     #Get HaloPSA Token based on the config we have.
-    $InformationPreference = 'Continue'
     $Table = Get-CIPPTable -TableName Extensionsconfig
     $Configuration = ((Get-CIPPAzDataTableEntity @Table).config | ConvertFrom-Json).HaloPSA
     $TicketTable = Get-CIPPTable -TableName 'PSATickets'
@@ -107,7 +106,7 @@ function New-HaloPSATicket {
         }
         Write-LogMessage -message "Failed to send ticket to HaloPSA: $Message" -API 'HaloPSATicket' -sev Error -LogData (Get-CippException -Exception $_)
         Write-Information "Failed to send ticket to HaloPSA: $Message"
-        Write-Information "Body we tried to ship: $body"
+        Write-Host "Body we tried to ship: $body"
         return "Failed to send ticket to HaloPSA: $Message"
     }
 }
