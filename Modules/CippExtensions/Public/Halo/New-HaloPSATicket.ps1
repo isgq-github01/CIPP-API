@@ -79,7 +79,7 @@ function New-HaloPSATicket {
     $body = ConvertTo-Json -Compress -Depth 10 -InputObject @($Object)
 
     Write-Information 'Sending ticket to HaloPSA'
-    Write-Information $body
+    Write-Host "Body we shipped: $body"
     try {
         if ($PSCmdlet.ShouldProcess('Send ticket to HaloPSA', 'Create ticket')) {
             $Ticket = Invoke-RestMethod -Uri "$($Configuration.ResourceURL)/Tickets" -ContentType 'application/json; charset=utf-8' -Method Post -Body $body -Headers @{Authorization = "Bearer $($token.access_token)" }
@@ -106,7 +106,7 @@ function New-HaloPSATicket {
         }
         Write-LogMessage -message "Failed to send ticket to HaloPSA: $Message" -API 'HaloPSATicket' -sev Error -LogData (Get-CippException -Exception $_)
         Write-Information "Failed to send ticket to HaloPSA: $Message"
-        Write-Host "Body we tried to ship: $body"
+        Write-Information "Body we tried to ship: $body"
         return "Failed to send ticket to HaloPSA: $Message"
     }
 }
