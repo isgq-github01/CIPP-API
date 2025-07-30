@@ -78,7 +78,7 @@ function New-HaloPSATicket {
     #use the token to create a new ticket in HaloPSA
     $body = ConvertTo-Json -Compress -Depth 10 -InputObject @($Object)
 
-    Write-Information 'Sending ticket to HaloPSA'
+    Write-Output 'Sending ticket to HaloPSA'
     Write-Host "Body we shipped: $body"
     try {
         if ($PSCmdlet.ShouldProcess('Send ticket to HaloPSA', 'Create ticket')) {
