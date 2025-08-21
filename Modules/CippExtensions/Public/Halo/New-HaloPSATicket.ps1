@@ -22,18 +22,18 @@ function New-HaloPSATicket {
       if ($Ticket.id) {
         if (!$Ticket.hasbeenclosed) {
           Write-Information 'Ticket is still open, adding new note'
-          $Object = [PSCustomObject]@{
+          <#$Object = [PSCustomObject]@{
             ticket_id      = $ExistingTicket.TicketID
             outcome_id     = 7
             hiddenfromuser = $true
             note_html      = $description
           }
-  
+
           if ($Configuration.Outcome) {
             $Outcome = $Configuration.Outcome.value ?? $Configuration.Outcome
             $Object.outcome_id = $Outcome
           }
-  
+
           $body = ConvertTo-Json -Compress -Depth 10 -InputObject @($Object)
           try {
             if ($PSCmdlet.ShouldProcess('Add note to HaloPSA ticket', 'Add note')) {
@@ -53,7 +53,7 @@ function New-HaloPSATicket {
             Write-Information "Failed to add note to HaloPSA ticket: $Message"
             Write-Information "Body we tried to ship: $body"
             return "Failed to add note to HaloPSA ticket: $Message"
-          }
+          }#>
         }
       }
       else {
