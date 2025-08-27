@@ -22,7 +22,7 @@ function New-HaloPSATicket {
       if ($Ticket.id) {
         if (!$Ticket.hasbeenclosed) {
           Write-Information 'Ticket is still open, adding new note'
-          <#$Object = [PSCustomObject]@{
+          $Object = [PSCustomObject]@{
             ticket_id      = $ExistingTicket.TicketID
             outcome_id     = 7
             hiddenfromuser = $true
@@ -53,7 +53,7 @@ function New-HaloPSATicket {
             Write-Information "Failed to add note to HaloPSA ticket: $Message"
             Write-Information "Body we tried to ship: $body"
             return "Failed to add note to HaloPSA ticket: $Message"
-          }#>
+          }
         }
       }
       else {
