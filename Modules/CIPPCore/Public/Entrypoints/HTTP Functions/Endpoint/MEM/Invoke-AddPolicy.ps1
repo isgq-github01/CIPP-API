@@ -17,6 +17,15 @@ function Invoke-AddPolicy {
     $description = $Request.Body.Description
     $AssignTo = if ($Request.Body.AssignTo -ne 'on') { $Request.Body.AssignTo }
     $ExcludeGroup = $Request.Body.excludeGroup
+    $AssignmentFilterSelection = $Request.Body.AssignmentFilterName ?? $Request.Body.assignmentFilter
+    $AssignmentFilterType = $Request.Body.AssignmentFilterType ?? $Request.Body.assignmentFilterType
+    $AssignmentFilterName = switch ($AssignmentFilterSelection) {
+        { $_ -is [string] } { $_; break }
+        { $_ -and $_.PSObject.Properties['value'] } { $_.value; break }
+        { $_ -and $_.PSObject.Properties['displayName'] } { $_.displayName; break }
+        { $_ -and $_.PSObject.Properties['label'] } { $_.label; break }
+        default { $null }
+    }
     $Request.Body.customGroup ? ($AssignTo = $Request.Body.customGroup) : $null
     $RawJSON = $Request.Body.RAWJson
 
@@ -46,6 +55,7 @@ function Invoke-AddPolicy {
                 # Discover referenced reusable settings from the policy JSON when none were supplied
                 $reusableResult = Get-CIPPReusableSettingsFromPolicy -PolicyJson $RawJSON -Tenant $Tenant -Headers $Headers -APIName $APIName
                 if ($reusableResult.ReusableSettings) { $reusableSettings = $reusableResult.ReusableSettings }
+                if ($reusableResult.RawJSON) { $RawJSON = $reusableResult.RawJSON }
             } catch {}
         }
 
@@ -70,6 +80,12 @@ function Invoke-AddPolicy {
                 Headers          = $Headers
                 APIName          = $APIName
             }
+
+            if (-not [string]::IsNullOrWhiteSpace($AssignmentFilterName)) {
+                $params.AssignmentFilterName = $AssignmentFilterName
+                $params.AssignmentFilterType = [string]::IsNullOrWhiteSpace($AssignmentFilterType) ? 'include' : $AssignmentFilterType
+            }
+
             Set-CIPPIntunePolicy @params
         } catch {
             "$($_.Exception.Message)"
