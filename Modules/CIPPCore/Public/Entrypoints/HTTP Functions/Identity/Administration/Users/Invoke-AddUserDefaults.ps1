@@ -31,6 +31,14 @@ function Invoke-AddUserDefaults {
             $Request.Body.usernameFormat.value
         }
 
+        $UsernameSpaceHandling = if ($Request.Body.usernameSpaceHandling -is [string]) {
+            $Request.Body.usernameSpaceHandling
+        } else {
+            $Request.Body.usernameSpaceHandling.value
+        }
+
+        $UsernameSpaceReplacement = $Request.Body.usernameSpaceReplacement
+
         $PrimDomain = if ($Request.Body.primDomain -is [string]) {
             $Request.Body.primDomain
         } else {
@@ -73,6 +81,9 @@ function Invoke-AddUserDefaults {
         $SetSponsor = $Request.Body.setSponsor
         $CopyFrom = $Request.Body.copyFrom
 
+        # Groups
+        $GroupMemberships = if ($Request.Body.addToGroups) { $Request.Body.addToGroups } else { $Request.Body.groupMemberships }
+
         # Create template object with all fields from CippAddEditUser
         $TemplateObject = @{
             tenantFilter     = $TenantFilter
@@ -104,6 +115,7 @@ function Invoke-AddUserDefaults {
             setManager       = $SetManager
             setSponsor       = $SetSponsor
             copyFrom         = $CopyFrom
+            groupMemberships = $GroupMemberships
         }
 
         # Use existing GUID if editing, otherwise generate new one
@@ -124,7 +136,7 @@ function Invoke-AddUserDefaults {
 
         $Action = if ($Request.Body.GUID) { 'Updated' } else { 'Created' }
         $Result = "$Action User Default Template '$($TemplateName)' with GUID $GUID"
-        Write-LogMessage -headers $Headers -API $APIName -message $Result -Sev 'Info'
+        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Result -Sev 'Info'
         $StatusCode = [HttpStatusCode]::OK
 
     } catch {
