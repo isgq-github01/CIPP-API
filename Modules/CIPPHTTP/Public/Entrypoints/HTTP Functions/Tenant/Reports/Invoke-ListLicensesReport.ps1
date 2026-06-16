@@ -1,9 +1,11 @@
-function Invoke-ListLicenses {
+function Invoke-ListLicensesReport {
     <#
     .FUNCTIONALITY
         Entrypoint
     .ROLE
         Tenant.Directory.Read
+    .DESCRIPTION
+        Lists a detailed license overview across all tenants or a single tenant, including SKU breakdowns, costs, and availability.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -61,6 +63,13 @@ function Invoke-ListLicenses {
                 }
                 $GraphRequest = @()
             }
+        }
+    }
+
+    # Strip the Term property from each TermInfo entry before returning
+    foreach ($Result in $GraphRequest) {
+        if ($Result.TermInfo) {
+            $Result.TermInfo = @($Result.TermInfo | Select-Object -Property * -ExcludeProperty Term)
         }
     }
 
