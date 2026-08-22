@@ -203,6 +203,30 @@ function Invoke-CIPPOffboardingJob {
                 }
             }
             @{
+                Condition  = { $Options.AccessSendAs.Count -gt 0 }
+                Cmdlet     = 'Set-CIPPMailboxAccess'
+                Parameters = @{
+                    tenantFilter    = $TenantFilter
+                    userid          = $Username
+                    AccessUser      = $Options.AccessSendAs
+                    PermissionLevel = 'SendAs'
+                    APIName         = $APIName
+                    Headers         = $Headers
+                }
+            }
+            @{
+                Condition  = { $Options.AccessSendOnBehalf.Count -gt 0 }
+                Cmdlet     = 'Set-CIPPMailboxAccess'
+                Parameters = @{
+                    tenantFilter    = $TenantFilter
+                    userid          = $Username
+                    AccessUser      = $Options.AccessSendOnBehalf
+                    PermissionLevel = 'SendOnBehalf'
+                    APIName         = $APIName
+                    Headers         = $Headers
+                }
+            }
+            @{
                 Condition  = { $Options.removePermissions -eq $true }
                 Cmdlet     = 'Remove-CIPPMailboxPermissions'
                 Parameters = @{
@@ -306,8 +330,9 @@ function Invoke-CIPPOffboardingJob {
         }
 
         if ($Batch.Count -eq 0) {
-            Write-LogMessage -API $APIName -tenant $TenantFilter -message "No offboarding tasks selected for user $Username" -sev Warning
-            return "No offboarding tasks were selected for $Username"
+            $NoTasksMessage = "No offboarding tasks were selected for $Username. The offboarding job was not executed - check that at least one action was enabled."
+            Write-LogMessage -API $APIName -tenant $TenantFilter -message $NoTasksMessage -sev Error
+            throw $NoTasksMessage
         }
 
         Write-Information "Built batch of $($Batch.Count) offboarding tasks for $Username"

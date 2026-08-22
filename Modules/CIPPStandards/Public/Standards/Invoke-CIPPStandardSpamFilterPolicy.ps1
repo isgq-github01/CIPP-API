@@ -51,9 +51,9 @@ function Invoke-CIPPStandardSpamFilterPolicy {
             {"type":"switch","name":"standards.SpamFilterPolicy.MarkAsSpamWebBugsInHtml","label":"Mark as spam if message contains web bugs (also known as web beacons)","defaultValue":false}
             {"type":"switch","name":"standards.SpamFilterPolicy.MarkAsSpamSensitiveWordList","label":"Mark as spam if message contains words from the sensitive words list","defaultValue":false}
             {"type":"switch","name":"standards.SpamFilterPolicy.EnableLanguageBlockList","label":"Enable language block list","defaultValue":false}
-            {"type":"autoComplete","multiple":true,"creatable":true,"required":false,"name":"standards.SpamFilterPolicy.LanguageBlockList","label":"Languages to block (uppercase ISO 639-1 two-letter)","condition":{"field":"standards.SpamFilterPolicy.EnableLanguageBlockList","compareType":"is","compareValue":true}}
+            {"type":"LanguageCodeMultiSelect","required":false,"name":"standards.SpamFilterPolicy.LanguageBlockList","label":"Languages to block (ISO 639-1 two-letter)","condition":{"field":"standards.SpamFilterPolicy.EnableLanguageBlockList","compareType":"is","compareValue":true}}
             {"type":"switch","name":"standards.SpamFilterPolicy.EnableRegionBlockList","label":"Enable region block list","defaultValue":false}
-            {"type":"autoComplete","multiple":true,"creatable":true,"required":false,"name":"standards.SpamFilterPolicy.RegionBlockList","label":"Regions to block (uppercase ISO 3166-1 two-letter)","condition":{"field":"standards.SpamFilterPolicy.EnableRegionBlockList","compareType":"is","compareValue":true}}
+            {"type":"CountryCodeMultiSelect","required":false,"name":"standards.SpamFilterPolicy.RegionBlockList","label":"Regions to block (ISO 3166-1 two-letter)","condition":{"field":"standards.SpamFilterPolicy.EnableRegionBlockList","compareType":"is","compareValue":true}}
             {"type":"autoComplete","multiple":true,"creatable":true,"required":false,"name":"standards.SpamFilterPolicy.AllowedSenderDomains","label":"Allowed sender domains"}
         IMPACT
             Medium Impact
@@ -82,16 +82,45 @@ function Invoke-CIPPStandardSpamFilterPolicy {
     } #we're done.
 
     # Use custom name if provided, otherwise use default for backward compatibility
-    $PolicyName = if ($Settings.name) { $Settings.name } else { 'CIPP Default Spam Filter Policy' }
+    $DefaultPolicyName = 'CIPP Default Spam Filter Policy'
+    $PolicyName = if ($Settings.name) { $Settings.name } else { $DefaultPolicyName }
 
     try {
-        $CurrentState = New-ExoRequest -TenantId $Tenant -cmdlet 'Get-HostedContentFilterPolicy' |
-        Where-Object -Property Name -EQ $PolicyName
+        $AllSpamFilterPolicies = New-ExoRequest -TenantId $Tenant -cmdlet 'Get-HostedContentFilterPolicy'
     } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the SpamFilterPolicy state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
     }
+
+    # Resolve which policy this standard manages. An exact name match always wins, so a tenant that
+    # already has a CIPP-created policy keeps using it. Otherwise, when the configured name is one of the
+    # aliases for Microsoft's built-in inbound anti-spam policy, adopt that built-in policy instead of
+    # creating a duplicate: Get-HostedContentFilterPolicy returns it named 'Default', while the Defender
+    # portal labels it "Anti-spam inbound policy" and older CIPP builds used "Default Spam Filter Policy".
+    # Customers targeting the built-in policy commonly enter any of these (the same rename workaround that
+    # works for the other Default* Defender standards, where the cmdlet name and portal name match). Any
+    # other value is a genuinely custom policy and is created as new.
+    $DefaultPolicyNames = @($DefaultPolicyName, 'Default Spam Filter Policy', 'Default', 'Anti-spam inbound policy')
+    $ExistingPolicy = $AllSpamFilterPolicies | Where-Object -Property Name -EQ $PolicyName | Select-Object -First 1
+    if ($null -eq $ExistingPolicy -and $PolicyName -in $DefaultPolicyNames) {
+        # No policy is literally named e.g. "Anti-spam inbound policy" - that is only the portal label.
+        # Fall back to the built-in default policy, identified by its IsDefault flag (or its 'Default'
+        # name if the flag is unavailable).
+        $ExistingPolicy = $AllSpamFilterPolicies | Where-Object { $_.IsDefault -eq $true } | Select-Object -First 1
+        if ($null -eq $ExistingPolicy) {
+            $ExistingPolicy = $AllSpamFilterPolicies | Where-Object -Property Name -EQ 'Default' | Select-Object -First 1
+        }
+    }
+    if ($null -ne $ExistingPolicy.Name) {
+        # Adopt the existing policy's real name so state comparison and remediation target it.
+        $PolicyName = $ExistingPolicy.Name
+    }
+
+    # The built-in default policy cannot have a HostedContentFilterRule, so rule remediation is skipped for it.
+    $IsDefaultPolicy = ($ExistingPolicy.IsDefault -eq $true) -or ($PolicyName -eq 'Default')
+
+    $CurrentState = $AllSpamFilterPolicies | Where-Object -Property Name -EQ $PolicyName
 
     $SpamAction = $Settings.SpamAction.value ?? $Settings.SpamAction
     $SpamQuarantineTag = $Settings.SpamQuarantineTag.value ?? $Settings.SpamQuarantineTag
@@ -102,6 +131,21 @@ function Invoke-CIPPStandardSpamFilterPolicy {
     $PhishSpamAction = $Settings.PhishSpamAction.value ?? $Settings.PhishSpamAction
     $PhishQuarantineTag = $Settings.PhishQuarantineTag.value ?? $Settings.PhishQuarantineTag
     $HighConfidencePhishQuarantineTag = $Settings.HighConfidencePhishQuarantineTag.value ?? $Settings.HighConfidencePhishQuarantineTag
+
+    # Normalize list settings to clean string arrays. Values may arrive as a proper array or as a
+    # single comma-delimited string; splitting and trimming makes Compare-Object and remediation reliable.
+    # Case is folded to match what EXO stores and validates: ISO 3166-1 regions uppercase, ISO 639-1 languages lowercase.
+    $LanguageBlockList = @(@($Settings.LanguageBlockList.value) | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+    $RegionBlockList = @(@($Settings.RegionBlockList.value) | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ })
+    $AllowedSenderDomains = @(@($Settings.AllowedSenderDomains.value ?? $Settings.AllowedSenderDomains) | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+    # Block lists only matter when their Enable* toggle is on; when off, the list is ignored entirely.
+    $CurrentLanguageBlockList = @($CurrentState.LanguageBlockList)
+    $CurrentRegionBlockList = @($CurrentState.RegionBlockList)
+    $LanguageBlockListCorrect = ($Settings.EnableLanguageBlockList -ne $true) -or
+        (($CurrentLanguageBlockList.Count -eq $LanguageBlockList.Count) -and (($LanguageBlockList.Count -eq 0) -or !(Compare-Object -ReferenceObject $CurrentLanguageBlockList -DifferenceObject $LanguageBlockList)))
+    $RegionBlockListCorrect = ($Settings.EnableRegionBlockList -ne $true) -or
+        (($CurrentRegionBlockList.Count -eq $RegionBlockList.Count) -and (($RegionBlockList.Count -eq 0) -or !(Compare-Object -ReferenceObject $CurrentRegionBlockList -DifferenceObject $RegionBlockList)))
 
     $IncreaseScoreWithImageLinks = if ($Settings.IncreaseScoreWithImageLinks) { 'On' } else { 'Off' }
     $IncreaseScoreWithBizOrInfoUrls = if ($Settings.IncreaseScoreWithBizOrInfoUrls) { 'On' } else { 'Off' }
@@ -146,10 +190,10 @@ function Invoke-CIPPStandardSpamFilterPolicy {
         ($CurrentState.PhishZapEnabled -eq $true) -and
         ($CurrentState.SpamZapEnabled -eq $true) -and
         ($CurrentState.EnableLanguageBlockList -eq $Settings.EnableLanguageBlockList) -and
-        ((($null -eq $CurrentState.LanguageBlockList -or $CurrentState.LanguageBlockList.Count -eq 0) -and ($null -eq $Settings.LanguageBlockList.value)) -or ($null -ne $CurrentState.LanguageBlockList -and $CurrentState.LanguageBlockList.Count -gt 0 -and $null -ne $Settings.LanguageBlockList.value -and !(Compare-Object -ReferenceObject $CurrentState.LanguageBlockList -DifferenceObject $Settings.LanguageBlockList.value))) -and
+        $LanguageBlockListCorrect -and
         ($CurrentState.EnableRegionBlockList -eq $Settings.EnableRegionBlockList) -and
-        ((($null -eq $CurrentState.RegionBlockList -or $CurrentState.RegionBlockList.Count -eq 0) -and ($null -eq $Settings.RegionBlockList.value)) -or ($null -ne $CurrentState.RegionBlockList -and $CurrentState.RegionBlockList.Count -gt 0 -and $null -ne $Settings.RegionBlockList.value -and !(Compare-Object -ReferenceObject $CurrentState.RegionBlockList -DifferenceObject $Settings.RegionBlockList.value))) -and
-        ((($null -eq $CurrentState.AllowedSenderDomains -or $CurrentState.AllowedSenderDomains.Count -eq 0) -and ($null -eq ($Settings.AllowedSenderDomains.value ?? $Settings.AllowedSenderDomains))) -or ($null -ne $CurrentState.AllowedSenderDomains -and $CurrentState.AllowedSenderDomains.Count -gt 0 -and $null -ne ($Settings.AllowedSenderDomains.value ?? $Settings.AllowedSenderDomains) -and !(Compare-Object -ReferenceObject $CurrentState.AllowedSenderDomains -DifferenceObject ($Settings.AllowedSenderDomains.value ?? $Settings.AllowedSenderDomains))))
+        $RegionBlockListCorrect -and
+        ((($null -eq $CurrentState.AllowedSenderDomains -or $CurrentState.AllowedSenderDomains.Count -eq 0) -and ($AllowedSenderDomains.Count -eq 0)) -or ($null -ne $CurrentState.AllowedSenderDomains -and $CurrentState.AllowedSenderDomains.Count -gt 0 -and $AllowedSenderDomains.Count -gt 0 -and !(Compare-Object -ReferenceObject $CurrentState.AllowedSenderDomains -DifferenceObject $AllowedSenderDomains)))
     } catch {
         $StateIsCorrect = $false
     }
@@ -201,19 +245,19 @@ function Invoke-CIPPStandardSpamFilterPolicy {
                 InlineSafetyTipsEnabled              = $true
                 PhishZapEnabled                      = $true
                 SpamZapEnabled                       = $true
-                AllowedSenderDomains                 = $Settings.AllowedSenderDomains.value ?? @{'@odata.type' = '#Exchange.GenericHashTable' }
+                AllowedSenderDomains                 = $AllowedSenderDomains.Count -gt 0 ? $AllowedSenderDomains : @{'@odata.type' = '#Exchange.GenericHashTable' }
             }
 
             # Remove optional block lists if not configured
-            if ($Settings.EnableLanguageBlockList -eq $true -and $Settings.LanguageBlockList.value) {
+            if ($Settings.EnableLanguageBlockList -eq $true -and $LanguageBlockList.Count -gt 0) {
                 $cmdParams.Add('EnableLanguageBlockList', $Settings.EnableLanguageBlockList)
-                $cmdParams.Add('LanguageBlockList', $Settings.LanguageBlockList.value)
+                $cmdParams.Add('LanguageBlockList', $LanguageBlockList)
             } else {
                 $cmdParams.Add('EnableLanguageBlockList', $false)
             }
-            if ($Settings.EnableRegionBlockList -eq $true -and $Settings.RegionBlockList.value) {
+            if ($Settings.EnableRegionBlockList -eq $true -and $RegionBlockList.Count -gt 0) {
                 $cmdParams.Add('EnableRegionBlockList', $Settings.EnableRegionBlockList)
-                $cmdParams.Add('RegionBlockList', $Settings.RegionBlockList.value)
+                $cmdParams.Add('RegionBlockList', $RegionBlockList)
             } else {
                 $cmdParams.Add('EnableRegionBlockList', $false)
             }
@@ -238,7 +282,7 @@ function Invoke-CIPPStandardSpamFilterPolicy {
             }
         }
 
-        if ($RuleStateIsCorrect -eq $false) {
+        if ($RuleStateIsCorrect -eq $false -and -not $IsDefaultPolicy) {
             $cmdParams = @{
                 Priority          = 0
                 RecipientDomainIs = ConvertTo-SafeArray -Field $AcceptedDomains.Name
@@ -309,9 +353,7 @@ function Invoke-CIPPStandardSpamFilterPolicy {
             MarkAsSpamWebBugsInHtml          = $CurrentState.MarkAsSpamWebBugsInHtml
             MarkAsSpamSensitiveWordList      = $CurrentState.MarkAsSpamSensitiveWordList
             EnableLanguageBlockList          = $CurrentState.EnableLanguageBlockList
-            LanguageBlockList                = $CurrentState.LanguageBlockList
             EnableRegionBlockList            = $CurrentState.EnableRegionBlockList
-            RegionBlockList                  = $CurrentState.RegionBlockList
             AllowedSenderDomains             = $CurrentState.AllowedSenderDomains
         }
         $ExpectedValue = @{
@@ -335,11 +377,20 @@ function Invoke-CIPPStandardSpamFilterPolicy {
             MarkAsSpamWebBugsInHtml          = $MarkAsSpamWebBugsInHtml
             MarkAsSpamSensitiveWordList      = $MarkAsSpamSensitiveWordList
             EnableLanguageBlockList          = $Settings.EnableLanguageBlockList
-            LanguageBlockList                = $Settings.EnableLanguageBlockList ? @($Settings.EnableLanguageBlockList) : @()
             EnableRegionBlockList            = $Settings.EnableRegionBlockList
-            RegionBlockList                  = $Settings.RegionBlockList.value ? @($Settings.RegionBlockList.value) : @()
-            AllowedSenderDomains             = $Settings.AllowedSenderDomains.value ? @($Settings.AllowedSenderDomains.value) : @()
+            AllowedSenderDomains             = $AllowedSenderDomains
         }
+
+        # Only include the block lists in the comparison when their toggle is enabled; otherwise they are ignored.
+        if ($Settings.EnableLanguageBlockList) {
+            $CurrentValue['LanguageBlockList'] = $CurrentState.LanguageBlockList
+            $ExpectedValue['LanguageBlockList'] = $LanguageBlockList
+        }
+        if ($Settings.EnableRegionBlockList) {
+            $CurrentValue['RegionBlockList'] = $CurrentState.RegionBlockList
+            $ExpectedValue['RegionBlockList'] = $RegionBlockList
+        }
+
         Set-CIPPStandardsCompareField -FieldName 'standards.SpamFilterPolicy' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $Tenant
     }
 }
