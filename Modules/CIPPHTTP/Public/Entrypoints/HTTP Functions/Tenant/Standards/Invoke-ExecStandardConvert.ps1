@@ -8,6 +8,9 @@ function Invoke-ExecStandardConvert {
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
 
+    $APIName = $Request.Params.CIPPEndpoint
+    $Headers = $Request.Headers
+
     function Convert-SingleStandardItem {
         param(
             [Parameter(Mandatory)]
@@ -222,15 +225,19 @@ function Invoke-ExecStandardConvert {
             $Table = Get-CippTable -tablename 'standards'
             $OldStdsTableItems = Get-CIPPAzDataTableEntity @Table -Filter $Filter
             try {
-                Remove-AzDataTableEntity @Table -Entity $OldStdsTableItems -Force
+                Remove-CIPPAzDataTableEntity @Table -Entity $OldStdsTableItems -Force
             } catch {
                 #donothing
             }
         }
     }
 
+    $Result = "Successfully converted $($StandardsToConvert.Count) legacy standard(s) to new format"
+    Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message $Result -Sev 'Info'
+
     return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = 'Successfully converted legacy standards to new format'
         })
 }
+

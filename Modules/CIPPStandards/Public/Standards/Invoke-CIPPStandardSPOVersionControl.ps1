@@ -18,7 +18,7 @@ function Invoke-CIPPStandardSPOVersionControl {
         ADDEDCOMPONENT
             {"type":"switch","name":"standards.SPOVersionControl.EnableAutoTrim","label":"Enable Automatic Version Trimming (Microsoft managed)"}
             {"type":"number","name":"standards.SPOVersionControl.MajorVersionLimit","label":"Maximum Major Versions (when auto trim is off)","default":50}
-            {"type":"number","name":"standards.SPOVersionControl.ExpireVersionsAfterDays","label":"Expire Versions After Days (0 = never, when auto trim is off)","default":0}
+            {"type":"number","name":"standards.SPOVersionControl.ExpireVersionsAfterDays","label":"Expire Versions After Days (0 = never, otherwise 30-36500, when auto trim is off)","default":0,"validators":{"min":{"value":0,"message":"Use 0 for never, or 30 or more days"},"max":{"value":36500,"message":"Maximum value is 36500"}}}
             {"type":"switch","name":"standards.SPOVersionControl.ApplyToExistingSites","label":"Apply to all existing sites and document libraries"}
         IMPACT
             Medium Impact
@@ -53,8 +53,18 @@ function Invoke-CIPPStandardSPOVersionControl {
     $DesiredMajorVersionLimit = [int]($Settings.MajorVersionLimit ?? 50)
     $DesiredExpireVersionsAfterDays = [int]($Settings.ExpireVersionsAfterDays ?? 0)
 
+    # SharePoint only accepts 0 (never expire) or 30-36500 days for version expiration. Reject
+    # anything in the 1-29 gap (or above the max) up front so we never send a value the tenant
+    # will refuse. This is the same 30-day floor the version cleanup (trim) job enforces.
+    if (-not $DesiredAutoTrim -and $DesiredExpireVersionsAfterDays -ne 0 -and
+        ($DesiredExpireVersionsAfterDays -lt 30 -or $DesiredExpireVersionsAfterDays -gt 36500)) {
+        Write-LogMessage -API 'Standards' -tenant $Tenant -message "SPOVersionControl: ExpireVersionsAfterDays must be 0 (never) or between 30 and 36500 days. Received '$DesiredExpireVersionsAfterDays'. Skipping standard." -sev Error
+        return
+    }
+
     try {
-        $CurrentState = Get-CIPPSPOTenant -TenantFilter $Tenant | Select-Object -Property _ObjectIdentity_, TenantFilter, EnableAutoExpirationVersionTrim, MajorVersionLimit, ExpireVersionsAfterDays
+        # SharePoint app-only requires the SAM certificate; delegated is not available on every tenant.
+        $CurrentState = Get-CIPPSPOTenant -TenantFilter $Tenant -UseCertificate | Select-Object -Property _ObjectIdentity_, TenantFilter, EnableAutoExpirationVersionTrim, MajorVersionLimit, ExpireVersionsAfterDays
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API 'Standards' -Tenant $Tenant -message "Could not get the SPOVersionControl state for $Tenant. Error: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
@@ -100,7 +110,7 @@ function Invoke-CIPPStandardSPOVersionControl {
                         @{ Type = 'Int32'; Value = $DesiredExpireVersionsAfterDays }
                     )
                 }
-                $CurrentState | Set-CIPPSPOTenant -MethodName 'SetFileVersionPolicy' -MethodParameters $MethodParams
+                $CurrentState | Set-CIPPSPOTenant -MethodName 'SetFileVersionPolicy' -MethodParameters $MethodParams -UseCertificate
                 Write-LogMessage -API 'Standards' -tenant $Tenant -message "Successfully configured SharePoint version control (AutoTrim: $DesiredAutoTrim, MajorVersionLimit: $DesiredMajorVersionLimit, ExpireVersionsAfterDays: $DesiredExpireVersionsAfterDays)" -sev Info
 
                 # Apply to all existing sites and their document libraries
@@ -119,15 +129,14 @@ function Invoke-CIPPStandardSPOVersionControl {
                         $SiteProperties.ExpireVersionsAfterDays = $DesiredExpireVersionsAfterDays
                     }
 
-                    foreach ($Site in $Sites) {
-                        try {
-                            Set-CIPPSPOSite -TenantFilter $Tenant -SiteUrl $Site.webUrl -Properties $SiteProperties
-                        } catch {
-                            $SiteError = Get-CippException -Exception $_
-                            Write-LogMessage -API 'Standards' -tenant $Tenant -message "Failed to set version policy for site $($Site.webUrl): $($SiteError.NormalizedError)" -sev Error -LogData $SiteError
-                        }
+                    # One concurrent batch instead of ~2s per site serially.
+                    $BulkSites = @($Sites | ForEach-Object { @{ SiteUrl = $_.webUrl; Properties = $SiteProperties } })
+                    $BulkResults = @(Set-CIPPSPOSiteBulk -TenantFilter $Tenant -Sites $BulkSites -UseCertificate)
+                    $FailedSites = @($BulkResults | Where-Object { -not $_.Success })
+                    foreach ($FailedSite in $FailedSites) {
+                        Write-LogMessage -API 'Standards' -tenant $Tenant -message "Failed to set version policy for site $($FailedSite.SiteUrl): $($FailedSite.Error)" -sev Error
                     }
-                    Write-LogMessage -API 'Standards' -tenant $Tenant -message 'Finished applying version policy to existing sites' -sev Info
+                    Write-LogMessage -API 'Standards' -tenant $Tenant -message "Finished applying version policy to $($Sites.Count - $FailedSites.Count) of $($Sites.Count) existing sites" -sev Info
                 }
             } catch {
                 $ErrorMessage = Get-CippException -Exception $_

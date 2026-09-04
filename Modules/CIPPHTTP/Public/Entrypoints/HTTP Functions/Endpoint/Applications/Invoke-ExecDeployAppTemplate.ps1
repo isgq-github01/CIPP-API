@@ -51,7 +51,7 @@ function Invoke-ExecDeployAppTemplate {
             try {
                 $Config = $App.config
                 if ($Config -is [string]) {
-                    $Config = $Config | ConvertFrom-Json -Depth 100
+                    $Config = $Config | ConvertFrom-CippAppConfig
                 }
 
                 $AppType = "$($App.appType ?? $App.AppType)"
@@ -80,27 +80,30 @@ function Invoke-ExecDeployAppTemplate {
                     'officeApp'      { Invoke-AddOfficeApp -Request $MockRequest -TriggerMetadata $null }
                     'win32ScriptApp' { Invoke-AddWin32ScriptApp -Request $MockRequest -TriggerMetadata $null }
                     'mspApp'         { Invoke-AddMSPApp -Request $MockRequest -TriggerMetadata $null }
+                    'edgeApp'        { Invoke-AddEdgeApp -Request $MockRequest -TriggerMetadata $null }
                     default          { throw "Unknown app type: $AppType" }
                 }
 
-                if ($HandlerResult.Body.Results) {
+                $DeployedResult = if ($HandlerResult.Body.Results) {
                     $HandlerResult.Body.Results
                 } elseif ($HandlerResult.Body) {
                     $HandlerResult.Body
                 } else {
                     "Queued '$($App.appName)'"
                 }
+                Write-LogMessage -headers $Headers -API $APIName -message "Deployed app '$($App.appName)' ($AppType) from template $TemplateId" -Sev 'Info'
+                $DeployedResult
             } catch {
                 $ErrorMessage = Get-CippException -Exception $_
-                "Failed '$($App.appName)': $($ErrorMessage.NormalizedMessage)"
-                Write-LogMessage -headers $Headers -API $APIName -message "Failed to deploy app '$($App.appName)' from template: $($ErrorMessage.NormalizedMessage)" -Sev 'Error' -LogData $ErrorMessage
+                "Failed '$($App.appName)': $($ErrorMessage.NormalizedError)"
+                Write-LogMessage -headers $Headers -API $APIName -message "Failed to deploy app '$($App.appName)' from template: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
             }
         }
 
         $StatusCode = [HttpStatusCode]::OK
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
-        $Results = "Failed to deploy app template: $($ErrorMessage.NormalizedMessage)"
+        $Results = "Failed to deploy app template: $($ErrorMessage.NormalizedError)"
         Write-LogMessage -headers $Headers -API $APIName -message $Results -Sev 'Error' -LogData $ErrorMessage
         $StatusCode = [HttpStatusCode]::InternalServerError
     }
