@@ -37,22 +37,25 @@ function Get-TenantGroups {
 
     $CacheKey = "$GroupId|$TenantFilter|$($Dynamic.IsPresent)"
 
+    # An empty allowed list means no groups, not every group; checked before the cache so a result cached under a wider scope never answers
+    $GroupScoped = $script:CippAllowedGroupsStorage -and $null -ne $script:CippAllowedGroupsStorage.Value
+    if ($GroupId -and $GroupScoped -and $script:CippAllowedGroupsStorage.Value -notcontains $GroupId) {
+        return @()
+    }
+
+    # Evaluate table cache expiry before consulting the result cache, otherwise a
+    # result-cache hit returns stale data forever and the TTL is never enforced
+    $CacheExpired = $script:TenantGroupsCache.LastRefresh -and ((Get-Date) - $script:TenantGroupsCache.LastRefresh) -gt $script:TenantGroupsCacheTTL
+
     if ($SkipCache) {
         Write-Verbose "Skipping cache for: $CacheKey"
-    } elseif ($script:TenantGroupsResultCache.ContainsKey($CacheKey)) {
+    } elseif (-not $CacheExpired -and $script:TenantGroupsResultCache.ContainsKey($CacheKey)) {
         Write-Verbose "Returning cached result for: $CacheKey"
         return $script:TenantGroupsResultCache[$CacheKey]
     }
 
-    # Early exit if specific GroupId requested but not allowed
-    if ($GroupId -and $script:CippAllowedGroupsStorage -and $script:CippAllowedGroupsStorage.Value) {
-        if ($script:CippAllowedGroupsStorage.Value -notcontains $GroupId) {
-            return @()
-        }
-    }
 
     # Load table data into cache if not already loaded or expired
-    $CacheExpired = $script:TenantGroupsCache.LastRefresh -and ((Get-Date) - $script:TenantGroupsCache.LastRefresh) -gt $script:TenantGroupsCacheTTL
     if (-not $script:TenantGroupsCache.Groups -or -not $script:TenantGroupsCache.Members -or $SkipCache -or $CacheExpired) {
         Write-Verbose 'Loading TenantGroups and TenantGroupMembers tables into cache'
 
@@ -111,7 +114,7 @@ function Get-TenantGroups {
         $Groups = $Groups | Where-Object { $_.RowKey -eq $GroupId }
     }
 
-    if ($script:CippAllowedGroupsStorage -and $script:CippAllowedGroupsStorage.Value) {
+    if ($GroupScoped) {
         $Groups = $Groups | Where-Object { $script:CippAllowedGroupsStorage.Value -contains $_.RowKey }
     }
 

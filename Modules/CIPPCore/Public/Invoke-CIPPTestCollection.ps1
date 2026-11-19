@@ -9,14 +9,8 @@ function Invoke-CIPPTestCollection {
         name prefix via Get-Command — no filesystem paths are used, so this works
         correctly with ModuleBuilder compiled modules.
 
-        Suite-to-pattern map (single source of truth):
-        - ZTNA             → Invoke-CippTestZTNA*
-        - ORCA             → Invoke-CippTestORCA*
-        - EIDSCA           → Invoke-CippTestEIDSCA*
-        - CISA             → Invoke-CippTestCISA*
-        - CIS              → Invoke-CippTestCIS_*
-        - SMB1001          → Invoke-CippTestSMB1001_*
-        - CopilotReadiness → Invoke-CippTestCopilotReady*
+        The suite-to-pattern map lives in Get-CippTestSuitePatterns (single source of truth,
+        also used to label stored results with their suite). One special case here:
         - Custom           → Special: enumerates enabled ScriptGuids from DB and calls
                              Invoke-CippTestCustomScripts once per guid (the function
                              requires a ScriptGuid parameter to filter the table query)
@@ -33,25 +27,17 @@ function Invoke-CIPPTestCollection {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('ZTNA', 'ORCA', 'EIDSCA', 'CISA', 'CIS', 'SMB1001', 'CopilotReadiness', 'GenericTests', 'Custom')]
+        [ValidateSet('ZTNA', 'ORCA', 'EIDSCA', 'CISA', 'CIS', 'SMB1001', 'CopilotReadiness', 'GenericTests', 'E8', 'SecuritySimulations', 'Custom')]
         [string]$SuiteName,
 
         [Parameter(Mandatory = $true)]
         [string]$TenantFilter
     )
 
-    # Canonical suite-to-pattern map — single source of truth for grouping.
-    # Discovery is done via Get-Command so this is path-independent and ModuleBuilder safe.
-    $SuitePatterns = @{
-        ZTNA             = 'Invoke-CippTestZTNA*'
-        ORCA             = 'Invoke-CippTestORCA*'
-        EIDSCA           = 'Invoke-CippTestEIDSCA*'
-        CISA             = 'Invoke-CippTestCISA*'
-        CIS              = 'Invoke-CippTestCIS_*'
-        SMB1001          = 'Invoke-CippTestSMB1001_*'
-        CopilotReadiness = 'Invoke-CippTestCopilotReady*'
-        GenericTests     = 'Invoke-CippTestGenericTest*'
-    }
+    # Canonical suite-to-pattern map — single source of truth, shared with the suite labelling in
+    # Get-CIPPTestResultsTenants. Discovery is done via Get-Command so this is path-independent
+    # and ModuleBuilder safe.
+    $SuitePatterns = Get-CippTestSuitePatterns
 
     $SuiteStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $SuccessCount = 0
@@ -104,6 +90,7 @@ function Invoke-CIPPTestCollection {
 
         $Table = Get-CippTable -tablename 'CippTestResults'
         $ResultBatch = [System.Collections.Generic.List[hashtable]]::new()
+        $AlertBatch = [System.Collections.Generic.List[object]]::new()
 
         foreach ($Guid in $EnabledGuids) {
             $ItemStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -113,6 +100,8 @@ function Invoke-CIPPTestCollection {
                 foreach ($Entity in $TestOutput) {
                     if ($Entity -is [hashtable] -and $Entity.PartitionKey -and $Entity.RowKey) {
                         $ResultBatch.Add($Entity)
+                    } elseif ($Entity -isnot [hashtable] -and $Entity.PSObject.Properties['CippCustomTestAlert']) {
+                        $AlertBatch.Add($Entity)
                     }
                 }
                 if ($ResultBatch.Count -ge 100) {
@@ -141,6 +130,12 @@ function Invoke-CIPPTestCollection {
             Write-Information "  [Custom] Flushed final $($ResultBatch.Count) results to table"
         }
 
+        # Ship a single aggregated alert for the tenant covering all alert-worthy results.
+        if ($AlertBatch.Count -gt 0) {
+            Write-Information "  [Custom] Shipping $($AlertBatch.Count) custom test alert(s) for $TenantFilter"
+            Send-CIPPCustomTestAlert -TenantFilter $TenantFilter -Alerts @($AlertBatch)
+        }
+
         $SuiteStopwatch.Stop()
         $TotalElapsed = '{0:N3}' -f $SuiteStopwatch.Elapsed.TotalSeconds
         $Summary = "Custom suite for $TenantFilter completed in ${TotalElapsed}s — $SuccessCount/$($EnabledGuids.Count) ran, $FailedCount errored"
@@ -161,9 +156,15 @@ function Invoke-CIPPTestCollection {
         }
     }
 
-    # Standard suites: discover functions by name pattern via Get-Command.
+    # Standard suites: match the suite's name pattern against CIPPTests' exports (Get-Command -Module walks PSModulePath).
     $Pattern = $SuitePatterns[$SuiteName]
-    $TestFunctions = @(Get-Command -Name $Pattern -Module CIPPTests -ErrorAction SilentlyContinue)
+    $Exported = ((Get-Module -Name CIPPTests) ?? (Import-Module -Name CIPPTests -PassThru)).ExportedFunctions
+    $SuiteCommands = @{
+        Tests = @(foreach ($Function in $Exported.Values) { if ($Function.Name -like $Pattern) { $Function } })
+        Setup = $Exported["Initialize-CippTestSuite$SuiteName"]
+        Clear = $Exported["Clear-CippTestSuite$SuiteName"]
+    }
+    $TestFunctions = $SuiteCommands.Tests
     if ($TestFunctions.Count -eq 0) {
         Write-Information "No test functions found for suite $SuiteName (pattern: $Pattern) — skipping"
         return @{
@@ -182,6 +183,12 @@ function Invoke-CIPPTestCollection {
 
     $Table = Get-CippTable -tablename 'CippTestResults'
     $ResultBatch = [System.Collections.Generic.List[hashtable]]::new()
+
+    # A suite can share per-tenant work across its tests: Initialize-CippTestSuite<Suite> runs first, Clear-CippTestSuite<Suite> last.
+    $SuiteSetup = $SuiteCommands.Setup
+    if ($SuiteSetup) {
+        try { & $SuiteSetup -Tenant $TenantFilter } catch { Write-Information "  [$SuiteName] Suite setup failed, tests run without it: $($_.Exception.Message)" }
+    }
 
     foreach ($TestFunction in $TestFunctions) {
         $ItemStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -206,6 +213,8 @@ function Invoke-CIPPTestCollection {
             $Timings.Add(('{0} : {1:N3}s (FAILED)' -f $TestFunction.Name, $ItemStopwatch.Elapsed.TotalSeconds))
         }
     }
+
+    if ($SuiteSetup) { & $SuiteCommands.Clear }
 
     # Final flush
     if ($ResultBatch.Count -gt 0) {

@@ -18,11 +18,11 @@ Function Invoke-ListDefenderState {
     try {
         # If DeviceID is provided, get Defender state for that specific device
         if ($DeviceID) {
-            $GraphRequest = New-GraphGetRequest -tenantid $TenantFilter -uri "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($DeviceID)?`$expand=windowsProtectionState&`$select=id,deviceName,deviceType,operatingSystem,windowsProtectionState"
+            $GraphRequest = New-GraphGetRequest -tenantid $TenantFilter -uri "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($DeviceID)?`$expand=windowsProtectionState&`$select=id,deviceName,deviceType,operatingSystem,osVersion,windowsProtectionState"
         }
         # If no DeviceID is provided, get Defender state for all devices
         else {
-            $GraphRequest = New-GraphGetRequest -tenantid $TenantFilter -uri "https://graph.microsoft.com/beta/deviceManagement/managedDevices?`$expand=windowsProtectionState&`$select=id,deviceName,deviceType,operatingSystem,windowsProtectionState"
+            $GraphRequest = New-GraphGetRequest -tenantid $TenantFilter -uri "https://graph.microsoft.com/beta/deviceManagement/managedDevices?`$expand=windowsProtectionState&`$select=id,deviceName,deviceType,operatingSystem,osVersion,windowsProtectionState"
         }
 
         # Ensure we return an array even if single device
@@ -33,7 +33,7 @@ Function Invoke-ListDefenderState {
         $StatusCode = [HttpStatusCode]::OK
     } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
-        $StatusCode = [HttpStatusCode]::OK
+        $StatusCode = [HttpStatusCode]::InternalServerError
         $GraphRequest = "$($ErrorMessage)"
     }
     return ([HttpResponseContext]@{

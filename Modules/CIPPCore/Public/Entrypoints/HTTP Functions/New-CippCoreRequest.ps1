@@ -16,24 +16,10 @@ function New-CippCoreRequest {
     $HttpTimings = @{}
     $HttpTotalStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-    # Initialize AsyncLocal storage for thread-safe per-invocation context
-    if (-not $script:CippInvocationIdStorage) {
-        $script:CippInvocationIdStorage = [System.Threading.AsyncLocal[string]]::new()
-    }
-    if (-not $script:CippAllowedTenantsStorage) {
-        $script:CippAllowedTenantsStorage = [System.Threading.AsyncLocal[object]]::new()
-    }
-    if (-not $script:CippAllowedGroupsStorage) {
-        $script:CippAllowedGroupsStorage = [System.Threading.AsyncLocal[object]]::new()
-    }
-    if (-not $script:CippUserRolesStorage) {
-        $script:CippUserRolesStorage = [System.Threading.AsyncLocal[hashtable]]::new()
-    }
-
-    # Initialize user roles cache for this request
-    if (-not $script:CippUserRolesStorage.Value) {
-        $script:CippUserRolesStorage.Value = @{}
-    }
+    # Initialize and reset the per-invocation context slots. This has to happen before anything
+    # reads them: workers are reused between requests, so whatever the previous invocation left
+    # behind is still in scope until it is explicitly cleared.
+    Initialize-CippRequestContext
 
     # Set InvocationId in AsyncLocal storage for console logging correlation
     if ($global:TelemetryClient -and $TriggerMetadata.InvocationId) {
@@ -41,25 +27,7 @@ function New-CippCoreRequest {
     }
 
     $FunctionName = 'Invoke-{0}' -f $Request.Params.CIPPEndpoint
-    Write-Information "API Endpoint: $($Request.Params.CIPPEndpoint) | Frontend Version: $($Request.Headers.'X-CIPP-Version' ?? 'Not specified')"
-
-    # For now, while we're in read-only we force the role of the MCP API cred.
-    # When we remove the feature flag, in NG, we move this to use the users role/ident.
-    if ($Request.Params.CIPPEndpoint -eq 'ExecMcp' -and
-        $Request.Headers.'x-ms-client-principal' -and
-        $Request.Headers.'x-ms-client-principal-name' -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
-        try {
-            $McpPrincipal = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Request.Headers.'x-ms-client-principal')) | ConvertFrom-Json
-            $McpAppId = ($McpPrincipal.claims | Where-Object { $_.typ -in @('azp', 'appid') } | Select-Object -First 1).val
-            if ($McpAppId -and (Get-CippApiClient -AppId $McpAppId)) {
-                $Request.Headers | Add-Member -NotePropertyName 'x-ms-client-principal-name' -NotePropertyValue $McpAppId -Force
-                $Request.Headers | Add-Member -NotePropertyName 'x-ms-client-principal-idp' -NotePropertyValue 'aad' -Force
-                Write-Information "MCP request mapped to API client $McpAppId (running at the app's CIPP role)"
-            }
-        } catch {
-            Write-Information "MCP principal app resolution failed: $($_.Exception.Message)"
-        }
-    }
+    Write-Debug "API Endpoint: $($Request.Params.CIPPEndpoint) | Frontend Version: $($Request.Headers.'X-CIPP-Version' ?? 'Not specified')"
 
     # Store action source + acting identity for outbound User-Agent attribution
     Set-CippUserAgentContext -Headers $Request.Headers
@@ -76,13 +44,18 @@ function New-CippCoreRequest {
         }
     }
 
-    $DisabledEndpoint = $FeatureFlags | Where-Object {
-        $_.Enabled -eq $false -and $_.Endpoints -contains $Request.Params.CIPPEndpoint
-    } | Select-Object -First 1
+    $DisabledEndpoint = @($FeatureFlags).Where({ $_.Enabled -eq $false -and $_.Endpoints -contains $Request.Params.CIPPEndpoint }, 'First')[0]
 
     if ($DisabledEndpoint) {
         Write-Information "Endpoint $($Request.Params.CIPPEndpoint) is disabled via feature flag: $($DisabledEndpoint.Name)"
         $HttpTotalStopwatch.Stop()
+        if ($Request.Params.CIPPEndpoint -eq 'ExecMcp') {
+            return ([HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::ServiceUnavailable
+                    Headers    = @{ 'Content-Type' = 'application/json' }
+                    Body       = (@{ jsonrpc = '2.0'; id = $null; error = @{ code = -32001; message = 'The MCP Server feature is disabled on this CIPP instance. Enable it in CIPP > Application Settings > Features.' } } | ConvertTo-Json -Compress)
+                })
+        }
         return ([HttpResponseContext]@{
                 StatusCode = [HttpStatusCode]::ServiceUnavailable
                 Body       = "This feature has been disabled: $($DisabledEndpoint.Description)"
@@ -98,7 +71,8 @@ function New-CippCoreRequest {
             })
     }
 
-    if ($Request.Headers.'X-CIPP-Version') {
+    # The stored frontend version is kept in the process environment, shared by every worker, so a client on that version costs no table read
+    if ($Request.Headers.'X-CIPP-Version' -and $Request.Headers.'X-CIPP-Version' -ne [System.Environment]::GetEnvironmentVariable('CIPP_FRONTEND_VERSION')) {
         $Table = Get-CippTable -tablename 'Version'
         $FrontendVer = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'Version' and RowKey eq 'frontend'"
 
@@ -108,9 +82,49 @@ function New-CippCoreRequest {
                     RowKey       = 'frontend'
                     Version      = $Request.Headers.'X-CIPP-Version'
                 }) -Force
-        } elseif ([semver]$FrontendVer.Version -gt [semver]$Request.Headers.'X-CIPP-Version') {
-            Write-Warning "Client version $($Request.Headers.'X-CIPP-Version') is older than the current frontend version $($FrontendVer.Version)"
+            [System.Environment]::SetEnvironmentVariable('CIPP_FRONTEND_VERSION', [string]$Request.Headers.'X-CIPP-Version')
+        } else {
+            [System.Environment]::SetEnvironmentVariable('CIPP_FRONTEND_VERSION', [string]$FrontendVer.Version)
+            if ([semver]$FrontendVer.Version -gt [semver]$Request.Headers.'X-CIPP-Version') {
+                Write-Warning "Client version $($Request.Headers.'X-CIPP-Version') is older than the current frontend version $($FrontendVer.Version)"
+            }
         }
+    }
+
+    # A request names a tenant (tenantFilter) or a tenant group (tenantGroup), in the query or the body, never both. A group
+    # runs the endpoint's All Tenants path with the request scope narrowed to the group, so endpoints see
+    # tenantFilter=AllTenants and tenantGroup in the query, on a copy.
+    $BodyTenantFilter = @($Request.Body.tenantFilter).Where({ $_ }, 'First')[0]
+    $BodyTenantFilter = [string]($BodyTenantFilter.value ?? $BodyTenantFilter)
+    if ([string]$Request.Query.tenantFilter -like 'group:*' -or $BodyTenantFilter -like 'group:*') {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::BadRequest
+                Body       = 'Send a tenant group as tenantGroup, not tenantFilter.'
+            })
+    }
+    $TenantGroup = $Request.Query.tenantGroup ?? @($Request.Body.tenantGroup).Where({ $_ }, 'First')[0]
+    if ($TenantGroup) {
+        if (@($FeatureFlags).Where({ $_.Id -eq 'TenantGroupSelector' -and -not $_.Enabled }).Count) {
+            return ([HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::BadRequest
+                    Body       = 'Tenant group selection is turned off. Enable it in Application Settings > Features.'
+                })
+        }
+        if ($Request.Query.tenantFilter -or $BodyTenantFilter) {
+            return ([HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::BadRequest
+                    Body       = 'Send tenantFilter or tenantGroup, not both.'
+                })
+        }
+        $Query = @{}
+        if ($Request.Query -is [System.Collections.IDictionary]) {
+            foreach ($Key in $Request.Query.Keys) { $Query[$Key] = $Request.Query[$Key] }
+        } else {
+            foreach ($Property in $Request.Query.PSObject.Properties) { $Query[$Property.Name] = $Property.Value }
+        }
+        $Query.tenantFilter = 'AllTenants'
+        $Query.tenantGroup = $TenantGroup
+        $Request.Query = $Query
     }
 
     $HttpTrigger = @{
@@ -122,7 +136,8 @@ function New-CippCoreRequest {
         # Set script scope variables for Graph API to indicate HTTP request/high priority
         $script:XMsThrottlePriority = 'high'
 
-        if ((Get-Command -Name $FunctionName -ErrorAction SilentlyContinue) -or $FunctionName -eq 'Invoke-Me') {
+        # Invoke-Me is not a function: looking it up misses and searches every module on disk
+        if ($FunctionName -eq 'Invoke-Me' -or $ExecutionContext.InvokeCommand.GetCommand($FunctionName, 'Function')) {
             try {
                 $swAccess = [System.Diagnostics.Stopwatch]::StartNew()
                 $Access = Test-CIPPAccess -Request $Request
@@ -131,45 +146,70 @@ function New-CippCoreRequest {
                 if ($FunctionName -eq 'Invoke-Me') {
                     $HttpTotalStopwatch.Stop()
                     $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
+                    if ($DebugPreference -ne 'SilentlyContinue') {
+                        $HttpTimingsRounded = [ordered]@{}
+                        foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
+                        Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
+                    }
+                    return $Access
+                }
+                # One access line per real endpoint call; /me returns above and the
+                # scope lookups below stay silent. Context is set by Test-CIPPAccess.
+                if ($script:CippAccessUserContext) {
+                    Write-Information "Access: $($script:CippAccessUserContext.User) [$($script:CippAccessUserContext.Roles -join ', ')] -> $($Request.Params.CIPPEndpoint)"
+                }
+                $script:CippRealtimeUser = $Request.Headers.'x-ms-client-principal-name'
+            } catch {
+                $DeniedUser = if ($script:CippAccessUserContext) { " for user $($script:CippAccessUserContext.User) [$($script:CippAccessUserContext.Roles -join ', ')]" } else { '' }
+                Write-Information "Access denied for $FunctionName$($DeniedUser) : $($_.Exception.Message)"
+                $HttpTotalStopwatch.Stop()
+                $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
+                if ($DebugPreference -ne 'SilentlyContinue') {
                     $HttpTimingsRounded = [ordered]@{}
                     foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
                     Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
-                    return $Access
                 }
-            } catch {
-                Write-Information "Access denied for $FunctionName : $($_.Exception.Message)"
-                $HttpTotalStopwatch.Stop()
-                $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
-                $HttpTimingsRounded = [ordered]@{}
-                foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
-                Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
                 return ([HttpResponseContext]@{
-                        StatusCode = [HttpStatusCode]::Forbidden
+                        StatusCode = if ($_.Exception -is [System.ArgumentException]) { [HttpStatusCode]::BadRequest } else { [HttpStatusCode]::Forbidden }
                         Body       = $_.Exception.Message
                     })
             }
             $swTenants = [System.Diagnostics.Stopwatch]::StartNew()
-            $AllowedTenants = Test-CippAccess -Request $Request -TenantList
+            # The @() wrap is load-bearing: a scope-only call can return an empty list (a
+            # restricted caller entitled to nothing), and a bare assignment unwraps that to
+            # $null - the sentinel consumers read as 'unrestricted'. The wrap keeps the empty
+            # list an empty list so the storage below stores a restricted scope, not a free pass.
+            $AllowedTenants = @(Test-CippAccess -Request $Request -TenantList)
             $swTenants.Stop()
             $HttpTimings['AllowedTenants'] = $swTenants.Elapsed.TotalMilliseconds
 
             $swGroups = [System.Diagnostics.Stopwatch]::StartNew()
-            $AllowedGroups = Test-CippAccess -Request $Request -GroupList
+            $AllowedGroups = @(Test-CippAccess -Request $Request -GroupList)
             $swGroups.Stop()
             $HttpTimings['AllowedGroups'] = $swGroups.Elapsed.TotalMilliseconds
 
+            # Assign on every path, including the unrestricted one. Only writing the slot when
+            # access is limited is what allowed a restricted user's scope to survive into the
+            # next request handled by the same worker, silently filtering results for someone
+            # entitled to see everything.
             if ($AllowedTenants -notcontains 'AllTenants') {
                 Write-Warning 'Limiting tenant access'
                 $script:CippAllowedTenantsStorage.Value = $AllowedTenants
+            } else {
+                $script:CippAllowedTenantsStorage.Value = $null
             }
             if ($AllowedGroups -notcontains 'AllGroups') {
                 Write-Warning 'Limiting group access'
                 $script:CippAllowedGroupsStorage.Value = $AllowedGroups
+            } else {
+                $script:CippAllowedGroupsStorage.Value = $null
             }
 
+            $ErrorMark = $global:Error[0]
+            $HttpResponse = $null
             try {
-                Write-Information "Access: $Access"
-                Write-LogMessage -headers $Headers -API $Request.Params.CIPPEndpoint -message 'Accessed this API' -Sev 'Debug'
+                Write-Debug "Access: $Access"
+                Write-LogMessage -headers $Request.Headers -API $Request.Params.CIPPEndpoint -message 'Accessed this API' -Sev 'Debug'
                 if ($Access) {
                     # Prepare telemetry metadata for HTTP API call
                     $metadata = @{
@@ -198,58 +238,58 @@ function New-CippCoreRequest {
                     $HttpTimings['InvokeEndpoint'] = $swInvoke.Elapsed.TotalMilliseconds
 
                     # Filter to only return HttpResponseContext objects
-                    $HttpResponse = $Response | Where-Object { $_.PSObject.TypeNames -eq 'Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext' }
-                    if ($HttpResponse) {
-                        # Return the first valid HttpResponseContext found
-                        $HttpTotalStopwatch.Stop()
-                        $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
-                        $HttpTimingsRounded = [ordered]@{}
-                        foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
-                        Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
-                        return ([HttpResponseContext]($HttpResponse | Select-Object -First 1))
-                    } else {
+                    $HttpResponse = @($Response).Where({ $_.PSObject.TypeNames -eq 'Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext' }, 'First')[0]
+                    if (-not $HttpResponse) {
                         # If no valid response context found, create a default success response
-                        if ($Response.PSObject.Properties.Name -contains 'StatusCode' -and $Response.PSObject.Properties.Name -contains 'Body') {
-                            $HttpTotalStopwatch.Stop()
-                            $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
-                            $HttpTimingsRounded = [ordered]@{}
-                            foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
-                            Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
-                            return ([HttpResponseContext]@{
-                                    StatusCode = $Response.StatusCode
-                                    Body       = $Response.Body
-                                })
+                        $HttpResponse = if ($Response.PSObject.Properties.Name -contains 'StatusCode' -and $Response.PSObject.Properties.Name -contains 'Body') {
+                            @{ StatusCode = $Response.StatusCode; Body = $Response.Body }
                         } else {
-                            $HttpTotalStopwatch.Stop()
-                            $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
-                            $HttpTimingsRounded = [ordered]@{}
-                            foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
-                            Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
-                            return ([HttpResponseContext]@{
-                                    StatusCode = [HttpStatusCode]::OK
-                                    Body       = $Response
-                                })
+                            @{ StatusCode = [HttpStatusCode]::OK; Body = $Response }
                         }
                     }
+                    $HttpResponse = [HttpResponseContext]$HttpResponse
                 }
             } catch {
                 Write-Warning "Exception occurred on HTTP trigger ($FunctionName): $($_.Exception.Message)"
-                $HttpTotalStopwatch.Stop()
-                $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
+                $HttpResponse = [HttpResponseContext]@{
+                    StatusCode = Get-CippErrorStatusCode -ErrorRecord $_
+                    Body       = $_.Exception.Message
+                }
+            }
+
+            # Endpoints catch their own errors, so look for an out-of-memory error raised anywhere during this request (a module's own $Error stays empty)
+            if ($HttpResponse -and [int]$HttpResponse.StatusCode -ge 500 -and $global:Error.Where({ [object]::ReferenceEquals($_, $ErrorMark) }, 'Until').Where({ ($_.Exception ?? $_).ToString() -match '(^|---> )System\.OutOfMemoryException' }, 'First').Count -gt 0) {
+                Write-Warning "Out of memory on HTTP trigger ($FunctionName)"
+                $HttpResponse = [HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::InternalServerError
+                    Body       = @{
+                        Results = if ($Request.Query.manualPagination -eq $true) {
+                            'This page is too large for the server to build. Request a smaller page (PageSize), or narrow tenantFilter to a single tenant.'
+                        } elseif ((Get-Command -Name $FunctionName).Definition -match 'manualPagination') {
+                            'This result is too large for the server to return in one response. Request it in pages with manualPagination=true and follow Metadata.nextLink, or narrow tenantFilter to a single tenant.'
+                        } else {
+                            'This result is too large for the server to return in one response. Narrow tenantFilter to a single tenant.'
+                        }
+                    }
+                }
+            }
+
+            $HttpTotalStopwatch.Stop()
+            $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
+            if ($DebugPreference -ne 'SilentlyContinue') {
                 $HttpTimingsRounded = [ordered]@{}
                 foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
                 Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
-                return ([HttpResponseContext]@{
-                        StatusCode = [HttpStatusCode]::InternalServerError
-                        Body       = $_.Exception.Message
-                    })
             }
+            return $HttpResponse
         } else {
             $HttpTotalStopwatch.Stop()
             $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
-            $HttpTimingsRounded = [ordered]@{}
-            foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
-            Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
+            if ($DebugPreference -ne 'SilentlyContinue') {
+                $HttpTimingsRounded = [ordered]@{}
+                foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
+                Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
+            }
             return ([HttpResponseContext]@{
                     StatusCode = [HttpStatusCode]::NotFound
                     Body       = 'Endpoint not found'
@@ -258,9 +298,11 @@ function New-CippCoreRequest {
     } else {
         $HttpTotalStopwatch.Stop()
         $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
-        $HttpTimingsRounded = [ordered]@{}
-        foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
-        Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
+        if ($DebugPreference -ne 'SilentlyContinue') {
+            $HttpTimingsRounded = [ordered]@{}
+            foreach ($Key in ($HttpTimings.Keys | Sort-Object)) { $HttpTimingsRounded[$Key] = [math]::Round($HttpTimings[$Key], 2) }
+            Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
+        }
         return ([HttpResponseContext]@{
                 StatusCode = [HttpStatusCode]::PreconditionFailed
                 Body       = 'Request not processed'

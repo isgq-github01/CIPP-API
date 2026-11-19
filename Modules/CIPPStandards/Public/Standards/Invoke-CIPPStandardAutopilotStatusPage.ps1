@@ -52,11 +52,14 @@ function Invoke-CIPPStandardAutopilotStatusPage {
         return $true
     } #we're done.
     try {
-        $CurrentConfig = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceManagement/deviceEnrollmentConfigurations?`$expand=assignments&orderBy=priority&`$filter=deviceEnrollmentConfigurationType eq 'windows10EnrollmentCompletionPageConfiguration' and priority eq 0" -tenantid $Tenant |
+        $CurrentConfig = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceManagement/deviceEnrollmentConfigurations?`$filter=deviceEnrollmentConfigurationType eq 'windows10EnrollmentCompletionPageConfiguration' and priority eq 0" -tenantid $Tenant |
             Select-Object -Property id, displayName, priority, showInstallationProgress, blockDeviceSetupRetryByUser, allowDeviceResetOnInstallFailure, allowLogCollectionOnInstallFailure, customErrorMessage, installProgressTimeoutInMinutes, allowDeviceUseOnInstallFailure, trackInstallProgressForAutopilotOnly, installQualityUpdates
 
         # Compatibility for standards made in v8.3.0 or before, which did not have the InstallWindowsUpdates setting
         $InstallWindowsUpdates = $Settings.InstallWindowsUpdates ?? $false
+        # Intune only stores the reset/use-on-failure flags while device use is blocked
+        $AllowReset = [bool]$Settings.BlockDevice -and [bool]$Settings.AllowReset
+        $AllowFail = [bool]$Settings.BlockDevice -and [bool]$Settings.AllowFail
 
         $StateIsCorrect = ($CurrentConfig.installProgressTimeoutInMinutes -eq $Settings.TimeOutInMinutes) -and
         ($CurrentConfig.customErrorMessage -eq $Settings.ErrorMessage) -and
@@ -65,8 +68,8 @@ function Invoke-CIPPStandardAutopilotStatusPage {
         ($CurrentConfig.trackInstallProgressForAutopilotOnly -eq $Settings.OBEEOnly) -and
         ($CurrentConfig.blockDeviceSetupRetryByUser -eq !$Settings.BlockDevice) -and
         ($CurrentConfig.installQualityUpdates -eq $InstallWindowsUpdates) -and
-        ($CurrentConfig.allowDeviceResetOnInstallFailure -eq $Settings.AllowReset) -and
-        ($CurrentConfig.allowDeviceUseOnInstallFailure -eq $Settings.AllowFail)
+        ($CurrentConfig.allowDeviceResetOnInstallFailure -eq $AllowReset) -and
+        ($CurrentConfig.allowDeviceUseOnInstallFailure -eq $AllowFail)
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API 'Standards' -tenant $Tenant -message "Failed to check Autopilot Enrollment Status Page: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
@@ -93,8 +96,8 @@ function Invoke-CIPPStandardAutopilotStatusPage {
         trackInstallProgressForAutopilotOnly = $Settings.OBEEOnly
         blockDeviceSetupRetryByUser          = !$Settings.BlockDevice
         installQualityUpdates                = $InstallWindowsUpdates
-        allowDeviceResetOnInstallFailure     = $Settings.AllowReset
-        allowDeviceUseOnInstallFailure       = $Settings.AllowFail
+        allowDeviceResetOnInstallFailure     = $AllowReset
+        allowDeviceUseOnInstallFailure       = $AllowFail
     }
 
     # Remediate if the state is not correct
@@ -128,7 +131,6 @@ function Invoke-CIPPStandardAutopilotStatusPage {
     # Report
     if ($Settings.report -eq $true) {
         Set-CIPPStandardsCompareField -FieldName 'standards.AutopilotStatusPage' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
-        Add-CIPPBPAField -FieldName 'AutopilotStatusPage' -FieldValue [bool]$StateIsCorrect -StoreAs bool -Tenant $Tenant
     }
 
     # Alert

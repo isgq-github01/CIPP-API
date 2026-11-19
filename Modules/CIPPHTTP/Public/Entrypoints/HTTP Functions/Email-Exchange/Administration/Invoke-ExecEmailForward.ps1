@@ -11,7 +11,6 @@ Function Invoke-ExecEmailForward {
 
     $APIName = $Request.Params.CIPPEndpoint
     $Headers = $Request.Headers
-    Write-LogMessage -headers $Headers -API $APINAME-message 'Accessed this API' -Sev 'Debug'
 
 
     $TenantFilter = $Request.Body.tenantFilter
@@ -20,17 +19,18 @@ Function Invoke-ExecEmailForward {
         $ForwardingAddress = $Request.Body.ForwardInternal
     } else {
         $ForwardingAddress = $Request.Body.ForwardInternal.value
+        $ForwardingDisplayName = [string]$Request.Body.ForwardInternal.label
     }
     $ForwardingSMTPAddress = $Request.Body.ForwardExternal
     $ForwardOption = $Request.Body.forwardOption
-    [bool]$KeepCopy = if ($Request.Body.KeepCopy -eq 'true') { $true } else { $false }
+    [bool]$KeepCopy = if ($Request.Body.KeepCopy -eq $true) { $true } else { $false }
 
     # Process the forwarding option based on the type selected
     switch ($ForwardOption) {
         'internalAddress' {
             # Set up internal forwarding to another mailbox within the organization
             try {
-                $Results = Set-CIPPForwarding -UserID $Username -TenantFilter $TenantFilter -APIName $APIName -Headers $Headers -Forward $ForwardingAddress -KeepCopy $KeepCopy
+                $Results = Set-CIPPForwarding -UserID $Username -TenantFilter $TenantFilter -APIName $APIName -Headers $Headers -Forward $ForwardingAddress -ForwardDisplayName $ForwardingDisplayName -KeepCopy $KeepCopy
                 $StatusCode = [HttpStatusCode]::OK
             } catch {
                 $Results = $_.Exception.Message

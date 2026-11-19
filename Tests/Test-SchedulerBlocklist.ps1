@@ -48,7 +48,7 @@ function Assert-Contains {
 # ---------------------------------------------------------------------------
 # Load blocklist function from source
 # ---------------------------------------------------------------------------
-$blocklistPath = Join-Path $PSScriptRoot '../Modules/CIPPCore/Private/Get-CIPPSchedulerBlockedCommands.ps1'
+$blocklistPath = Join-Path $PSScriptRoot '../Modules/CIPPCore/Public/Tools/Get-CIPPSchedulerBlockedCommands.ps1'
 if (-not (Test-Path $blocklistPath)) {
     Write-Error "Get-CIPPSchedulerBlockedCommands.ps1 not found at: $blocklistPath"
     exit 1
@@ -77,6 +77,14 @@ foreach ($cmd in @('Get-CippKeyVaultSecret')) {
 
 # Tenant enumeration
 Assert-True 'Blocklist contains Get-Tenants' ('Get-Tenants' -in $blocked)
+
+# Dispatchers, SAM credentials and unscoped Graph or URL helpers
+foreach ($cmd in @('Push-TableCleanupTask', 'Push-CIPPOffboardingTask', 'Push-ExecScheduledCommand', 'Start-CIPPOrchestrator', 'Invoke-CippSandboxScript', 'New-CippCustomScriptExecution', 'Get-CIPPSAMCredentials', 'New-GraphMultiTenantBulkRequest', 'New-GraphDeltaQuery', 'New-CIPPMFAConnectorToken', 'Get-CIPPIntuneReportRows', 'Get-CIPPAuditLogContent', 'Set-CIPPNotificationConfig')) {
+    Assert-True "Blocklist contains $cmd" ($cmd -in $blocked)
+}
+
+# The Graph retry is scheduled by the request helper itself and must stay schedulable
+Assert-True 'Blocklist does not contain New-CIPPGraphRetry' ('New-CIPPGraphRetry' -notin $blocked)
 
 # Extension tokens
 foreach ($cmd in @('Get-GradientToken', 'Get-HaloToken', 'Get-NinjaOneToken')) {

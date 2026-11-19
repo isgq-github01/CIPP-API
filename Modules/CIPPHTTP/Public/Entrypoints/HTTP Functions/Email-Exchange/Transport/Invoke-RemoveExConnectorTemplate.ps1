@@ -8,6 +8,10 @@ Function Invoke-RemoveExConnectorTemplate {
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
 
+    if (-not (Test-CippTemplateWriteAccess)) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::Forbidden; Body = @{ Results = 'Roles limited to specific tenants cannot change or remove shared templates.' } })
+    }
+
     $APIName = $Request.Params.CIPPEndpoint
     $Headers = $Request.Headers
 
@@ -18,7 +22,7 @@ Function Invoke-RemoveExConnectorTemplate {
         $SafeID = ConvertTo-CIPPODataFilterValue -Value $ID -Type Guid
         $Filter = "PartitionKey eq 'ExConnectorTemplate' and RowKey eq '$SafeID'"
         $ClearRow = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey
-        Remove-AzDataTableEntity -Force @Table -Entity $ClearRow
+        Remove-CIPPAzDataTableEntity -Force @Table -Entity $ClearRow
         $Result = "Removed Exchange Connector Template with ID $ID."
         Write-LogMessage -Headers $Headers -API $APIName -message $Result -Sev 'Info'
         $StatusCode = [HttpStatusCode]::OK

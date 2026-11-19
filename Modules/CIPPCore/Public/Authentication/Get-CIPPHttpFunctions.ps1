@@ -45,10 +45,12 @@ function Get-CIPPHttpFunctions {
 
             if ($Functionality -notmatch 'Entrypoint') { continue }
             if ($Role -eq 'Public') { continue }
-            [PSCustomObject]@{
-                Function    = $Function.Name
-                Role        = $Role
-                Description = $Description
+            foreach ($EachRole in @("$Role" -split ',')) {
+                [PSCustomObject]@{
+                    Function    = $Function.Name
+                    Role        = $EachRole.Trim()
+                    Description = $Description
+                }
             }
         }
 
@@ -68,6 +70,7 @@ function Get-CIPPHttpFunctions {
         }
         $Results
     } catch {
-        "Function Error $($_.Exception.Message): $($_.InvocationInfo.PositionMessage)"
+        # A failed enumeration must fail, or the caller caches the error text as the universe.
+        throw "Failed to enumerate HTTP function permissions: $($_.Exception.Message) $($_.InvocationInfo.PositionMessage)"
     }
 }

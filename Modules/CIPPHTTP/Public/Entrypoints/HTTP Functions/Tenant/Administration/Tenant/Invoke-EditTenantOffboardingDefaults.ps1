@@ -14,7 +14,8 @@ function Invoke-EditTenantOffboardingDefaults {
 
     # Interact with query parameters or the body of the request.
     $customerId = $Request.Body.customerId
-    $defaultDomainName = $Request.Body.defaultDomainName
+    # Older rows are keyed by domain; take it from the tenant, never the body, so a clear cannot reach another tenant's row
+    $defaultDomainName = @(Get-Tenants -TenantFilter $customerId -IncludeErrors)[0].defaultDomainName
     $offboardingDefaults = $Request.Body.offboardingDefaults
 
     if (!$customerId) {
@@ -29,11 +30,20 @@ function Invoke-EditTenantOffboardingDefaults {
         return
     }
 
+    # AnyTenant: enforce tenant scope here; Get-Tenants is narrowed to the caller's allowed tenants
+    $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+    if ($AllowedTenants -notcontains 'AllTenants' -and -not (Get-Tenants -TenantFilter $customerId)) {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::Forbidden
+                Body       = @{ state = 'error'; resultText = 'Access to this tenant is not allowed' }
+            })
+    }
+
     $PropertiesTable = Get-CippTable -TableName 'TenantProperties'
 
     try {
         # Convert the offboarding defaults to JSON string and ensure it's treated as a string
-        $jsonValue = [string]($offboardingDefaults | ConvertTo-Json -Compress)
+        $jsonValue = [string]([CIPP.CippJson]::ToJson($offboardingDefaults, 10) ?? (ConvertTo-Json -InputObject $offboardingDefaults -Compress -Depth 10))
 
         if ($jsonValue -and $jsonValue -ne '{}' -and $jsonValue -ne 'null' -and $jsonValue -ne '') {
             # Save offboarding defaults
@@ -53,7 +63,7 @@ function Invoke-EditTenantOffboardingDefaults {
             $toRemove = $existingDefaults | Where-Object { $_.PartitionKey -in $partitionKeys }
             if ($toRemove) {
                 foreach ($Entity in $toRemove) {
-                    Remove-AzDataTableEntity @PropertiesTable -Entity $Entity
+                    Remove-CIPPAzDataTableEntity @PropertiesTable -Entity $Entity
                 }
                 Write-LogMessage -headers $Headers -tenant $customerId -API $APIName -message "Removed tenant offboarding defaults for partition keys: $($partitionKeys -join ', ')" -Sev 'Info'
             }

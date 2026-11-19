@@ -8,6 +8,10 @@ function Invoke-RemoveIntuneTemplate {
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
 
+    if (-not (Test-CippTemplateWriteAccess)) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::Forbidden; Body = @{ Results = 'Roles limited to specific tenants cannot change or remove shared templates.' } })
+    }
+
     $APIName = $Request.Params.CIPPEndpoint
     $Headers = $Request.Headers
 
@@ -20,7 +24,7 @@ function Invoke-RemoveIntuneTemplate {
         $Filter = "PartitionKey eq 'IntuneTemplate' and RowKey eq '$SafeID'"
         $ClearRow = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey
         if ($ClearRow) {
-            Remove-AzDataTableEntity @Table -Entity $clearRow -Force
+            Remove-CIPPAzDataTableEntity @Table -Entity $clearRow -Force
             $Result = "Removed Intune Template with ID $ID."
         } else {
             $Result = "The template with ID $ID has already been deleted."

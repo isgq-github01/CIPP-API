@@ -3,7 +3,7 @@ function Invoke-ExecResetMFA {
     .FUNCTIONALITY
         Entrypoint
     .ROLE
-        Identity.User.ReadWrite
+        Identity.User.ReadWrite,Identity.PrivilegedUser.ReadWrite
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -11,14 +11,25 @@ function Invoke-ExecResetMFA {
     $Headers = $Request.Headers
 
     # Interact with query parameters or the body of the request.
-    $TenantFilter = $Request.Query.tenantFilter ?? $Request.Body.tenantFilter
-    $UserID = $Request.Query.ID ?? $Request.Body.ID
+    $TenantFilter = $Request.Body.tenantFilter
+    $UserID = $Request.Body.ID
+    # When supplied, only this single authentication method is removed instead of all of them.
+    $MethodId = $Request.Body.MethodId
+
+    $MFAParams = @{
+        UserPrincipalName = $UserID
+        TenantFilter      = $TenantFilter
+        Headers           = $Headers
+    }
+    if ($MethodId) { $MFAParams.MethodId = $MethodId }
+
     try {
-        $Result = Remove-CIPPUserMFA -UserPrincipalName $UserID -TenantFilter $TenantFilter -Headers $Headers
+        Assert-CippPrivilegedUserAccess -TenantFilter $TenantFilter -UserId $UserID
+        $Result = Remove-CIPPUserMFA @MFAParams
         $StatusCode = [HttpStatusCode]::OK
     } catch {
         $Result = $_.Exception.Message
-        $StatusCode = [HttpStatusCode]::InternalServerError
+        $StatusCode = Get-CippErrorStatusCode -ErrorRecord $_
     }
 
     return ([HttpResponseContext]@{

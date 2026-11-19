@@ -20,6 +20,19 @@ function Invoke-EditGroup {
     $GroupId = $UserObj.groupId.value ?? $UserObj.groupId
     $OrgGroup = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/groups/$($GroupId)" -tenantid $UserObj.tenantFilter
 
+    # The type above is whatever the form posted, and it decides every Exchange-vs-Graph branch
+    # below. Graph cannot change membership on a classic distribution list or a mail-enabled
+    # security group - it answers "Cannot Update a mail-enabled security groups and or distribution
+    # list" - so a missing or stale type on a stored option sends the request down a path that
+    # cannot work. $OrgGroup is the group itself, so let it settle the question and keep the posted
+    # value only for when the lookup came back without the flags.
+    if ($null -ne $OrgGroup.mailEnabled -or $null -ne $OrgGroup.securityEnabled) {
+        $GroupType = if ($OrgGroup.groupTypes -contains 'Unified') { 'Microsoft 365' }
+        elseif ($OrgGroup.mailEnabled -and $OrgGroup.securityEnabled) { 'Mail-Enabled Security' }
+        elseif ($OrgGroup.mailEnabled) { 'Distribution List' }
+        else { 'Security' }
+    }
+
     $AddMembers = $UserObj.AddMember
 
     $TenantId = $UserObj.tenantId ?? $UserObj.tenantFilter
@@ -33,16 +46,20 @@ function Invoke-EditGroup {
     if ($UserObj.displayName -or $UserObj.description -or $UserObj.mailNickname -or $UserObj.membershipRules) {
         #Edit properties:
         if ($GroupType -eq 'Distribution List' -or $GroupType -eq 'Mail-Enabled Security') {
+            # OperationGuid ties this request to its result; see Resolve-CippExoBulkResult.
+            $PropertiesGuid = [Guid]::NewGuid().ToString()
             $Params = @{ Identity = $GroupId; DisplayName = $UserObj.displayName; Description = $UserObj.description; name = $UserObj.mailNickname }
             $ExoBulkRequests.Add(@{
-                    CmdletInput = @{
+                    CmdletInput   = @{
                         CmdletName = 'Set-DistributionGroup'
                         Parameters = $Params
                     }
+                    OperationGuid = $PropertiesGuid
                 })
             $ExoLogs.Add(@{
-                    message = "Success - Edited group properties for $($GroupName) group. It might take some time to reflect the changes."
-                    target  = $GroupId
+                    message       = "Edited group properties for $($GroupName) group. It might take some time to reflect the changes."
+                    target        = $GroupId
+                    OperationGuid = $PropertiesGuid
                 })
         } else {
             # Use new securityEnabled value if provided, otherwise keep original
@@ -86,17 +103,20 @@ function Invoke-EditGroup {
                 }
 
                 if ($GroupType -eq 'Distribution List' -or $GroupType -eq 'Mail-Enabled Security') {
+                    $AddMemberGuid = [Guid]::NewGuid().ToString()
                     $Params = @{ Identity = $GroupId; Member = $Member; BypassSecurityGroupManagerCheck = $true }
                     # Write-Host ($UserObj | ConvertTo-Json -Depth 10) #Debugging line
                     $ExoBulkRequests.Add(@{
-                            CmdletInput = @{
+                            CmdletInput   = @{
                                 CmdletName = 'Add-DistributionGroupMember'
                                 Parameters = $Params
                             }
+                            OperationGuid = $AddMemberGuid
                         })
                     $ExoLogs.Add(@{
-                            message = "Added member $Member to $($GroupName) group"
-                            target  = $Member
+                            message       = "Added member $Member to $($GroupName) group"
+                            target        = $Member
+                            OperationGuid = $AddMemberGuid
                         })
                 } else {
                     $MemberIDs = $MemberODataBindString -f $MemberID
@@ -124,6 +144,46 @@ function Invoke-EditGroup {
         }
     }
 
+    $AddDevices = $UserObj.AddDevice
+    if ($AddDevices) {
+        $AddDevices | ForEach-Object {
+            $Device = $_
+            try {
+                $DeviceLabel = $Device.label ?? $Device.addedFields.deviceName ?? $Device.value
+                if ($GroupType -eq 'Distribution List' -or $GroupType -eq 'Mail-Enabled Security') {
+                    $Results.Add("Error - Devices cannot be added to a $GroupType group")
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $TenantId -message "Cannot add device $DeviceLabel to $($GroupName): devices are not supported in a $GroupType group" -Sev 'Error'
+                } else {
+                    # Intune device rows carry the Entra deviceId (azureADDeviceId) rather than the
+                    # directory object id - resolve it via the devices alternate key
+                    $DeviceID = $Device.value
+                    if ($Device.addedFields.azureADDeviceId) {
+                        $DeviceID = (New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/devices(deviceId='$($Device.addedFields.azureADDeviceId)')?`$select=id" -tenantid $TenantId).id
+                    }
+
+                    $AddDeviceBody = @{
+                        'members@odata.bind' = @($MemberODataBindString -f $DeviceID)
+                    }
+                    $BulkRequests.Add(@{
+                            id      = "addDevice-$DeviceID"
+                            method  = 'PATCH'
+                            url     = "groups/$($GroupId)"
+                            body    = $AddDeviceBody
+                            headers = @{
+                                'Content-Type' = 'application/json'
+                            }
+                        })
+                    $GraphLogs.Add(@{
+                            message = "Added device $DeviceLabel to $($GroupName) group"
+                            id      = "addDevice-$DeviceID"
+                        })
+                }
+            } catch {
+                Write-Warning "Error in AddDevices: $($_.Exception.Message)"
+                $Results.Add("Error - Failed to add device $DeviceLabel to $($GroupName): $($_.Exception.Message)")
+            }
+        }
+    }
 
     $AddContacts = $UserObj.AddContact
     if ($AddContacts) {
@@ -131,16 +191,19 @@ function Invoke-EditGroup {
             try {
                 $Member = $_
                 if ($GroupType -eq 'Distribution list' -or $GroupType -eq 'Mail-Enabled Security') {
+                    $AddContactGuid = [Guid]::NewGuid().ToString()
                     $Params = @{ Identity = $GroupId; Member = $Member.value; BypassSecurityGroupManagerCheck = $true }
                     $ExoBulkRequests.Add(@{
-                            CmdletInput = @{
+                            CmdletInput   = @{
                                 CmdletName = 'Add-DistributionGroupMember'
                                 Parameters = $Params
                             }
+                            OperationGuid = $AddContactGuid
                         })
                     $ExoLogs.Add(@{
-                            message = "Added contact $($Member.label) to $($GroupName) group"
-                            target  = $Member.value
+                            message       = "Added contact $($Member.label) to $($GroupName) group"
+                            target        = $Member.value
+                            OperationGuid = $AddContactGuid
                         })
                 } else {
                     Write-LogMessage -API $APIName -tenant $TenantId -headers $Headers -message 'You cannot add a Contact to a Security Group or a M365 Group' -Sev 'Error'
@@ -157,21 +220,24 @@ function Invoke-EditGroup {
         if ($RemoveContact) {
             $RemoveContact | ForEach-Object {
                 $Member = $_.addedFields.userPrincipalName ?? $_.value
-                $MemberID = $_.value
+                $MemberID = $_.addedFields.id ?? $_.value
                 if ($GroupType -eq 'Distribution list' -or $GroupType -eq 'Mail-Enabled Security') {
+                    $RemoveContactGuid = [Guid]::NewGuid().ToString()
                     $Params = @{ Identity = $GroupId; Member = $MemberID ; BypassSecurityGroupManagerCheck = $true }
                     $ExoBulkRequests.Add(@{
-                            CmdletInput = @{
+                            CmdletInput   = @{
                                 CmdletName = 'Remove-DistributionGroupMember'
                                 Parameters = $Params
                             }
+                            OperationGuid = $RemoveContactGuid
                         })
                     $ExoLogs.Add(@{
-                            message = "Removed contact $Member from $($GroupName) group"
-                            target  = $MemberID
+                            message       = "Removed contact $Member from $($GroupName) group"
+                            target        = $MemberID
+                            OperationGuid = $RemoveContactGuid
                         })
                 } else {
-                    Write-LogMessage -API $APIName-tenant $TenantId -headers $Headers -message 'You cannot remove a contact from a Security Group' -Sev 'Error'
+                    Write-LogMessage -API $APIName -tenant $TenantId -headers $Headers -message 'You cannot remove a contact from a Security Group' -Sev 'Error'
                     $Results.Add('You cannot remove a contact from a Security Group')
                 }
             }
@@ -187,16 +253,19 @@ function Invoke-EditGroup {
                 $Member = $_.addedFields.userPrincipalName ?? $_.value
                 $MemberID = $_.value
                 if ($GroupType -eq 'Distribution list' -or $GroupType -eq 'Mail-Enabled Security') {
+                    $RemoveMemberGuid = [Guid]::NewGuid().ToString()
                     $Params = @{ Identity = $GroupId; Member = $Member ; BypassSecurityGroupManagerCheck = $true }
                     $ExoBulkRequests.Add(@{
-                            CmdletInput = @{
+                            CmdletInput   = @{
                                 CmdletName = 'Remove-DistributionGroupMember'
                                 Parameters = $Params
                             }
+                            OperationGuid = $RemoveMemberGuid
                         })
                     $ExoLogs.Add(@{
-                            message = "Removed member $Member from $($GroupName) group"
-                            target  = $Member
+                            message       = "Removed member $Member from $($GroupName) group"
+                            target        = $Member
+                            OperationGuid = $RemoveMemberGuid
                         })
                 } else {
                     $BulkRequests.Add(@{
@@ -269,41 +338,145 @@ function Invoke-EditGroup {
     }
 
     if ($GroupType -in @( 'Distribution List', 'Mail-Enabled Security') -and ($AddOwners -or $RemoveOwners)) {
-        $CurrentOwners = New-ExoRequest -tenantid $TenantId -cmdlet 'Get-DistributionGroup' -cmdParams @{ Identity = $GroupId } -UseSystemMailbox $true | Select-Object -ExpandProperty ManagedBy
+        $CurrentOwnersRaw = @(
+            New-ExoRequest -tenantid $TenantId -cmdlet 'Get-DistributionGroup' -cmdParams @{ Identity = $GroupId } -UseSystemMailbox $true |
+                Select-Object -ExpandProperty ManagedBy
+        )
+        $CurrentResolved = @(Resolve-CIPPDirectoryId -Identity $CurrentOwnersRaw -TenantFilter $TenantId)
 
-        $NewManagedBy = [System.Collections.Generic.List[string]]::new()
-        foreach ($CurrentOwner in $CurrentOwners) {
-            if ($RemoveOwners -and $RemoveOwners.value -contains $CurrentOwner) {
-                $OwnerToRemove = $RemoveOwners | Where-Object { $_.value -eq $CurrentOwner }
-                $ExoLogs.Add(@{
-                        message = "Removed owner $($OwnerToRemove.label) from $($GroupName) group"
-                        target  = $GroupId
-                    })
-                continue
-            }
-            $NewManagedBy.Add($CurrentOwner)
+        $RemoveIds = @()
+        if ($RemoveOwners) {
+            $RemoveIds = @(
+                Resolve-CIPPDirectoryId -Identity @($RemoveOwners.value) -TenantFilter $TenantId |
+                    Where-Object { $_.Resolved -and $_.Id } |
+                    ForEach-Object { $_.Id }
+            )
         }
+        $AddResolved = @()
         if ($AddOwners) {
-            foreach ($NewOwner in $AddOwners) {
-                $NewManagedBy.Add($NewOwner.value)
-                $ExoLogs.Add(@{
-                        message = "Added owner $($NewOwner.label) to $($GroupName) group"
-                        target  = $GroupId
-                    })
+            $AddResolved = @(Resolve-CIPPDirectoryId -Identity @($AddOwners.value) -TenantFilter $TenantId)
+        }
+
+        # Every owner change here is carried by the one Set-DistributionGroup call below, so they
+        # share an OperationGuid: the ManagedBy rewrite either applies in full or not at all, and
+        # reporting per-owner outcomes that disagree with each other would be a lie.
+        $OwnersGuid = [Guid]::NewGuid().ToString()
+        $NewManagedBy = [System.Collections.Generic.List[string]]::new()
+        $RemoveIdSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$RemoveIds, [StringComparer]::OrdinalIgnoreCase)
+
+        foreach ($Entry in $CurrentResolved) {
+            if ($Entry.Resolved -and $Entry.Id) {
+                if ($RemoveIdSet.Contains($Entry.Id)) {
+                    $OwnerToRemove = $RemoveOwners | Where-Object {
+                        $_.value -eq $Entry.Id -or $_.value -eq $Entry.Input -or $_.addedFields.userPrincipalName -eq $Entry.UserPrincipalName
+                    } | Select-Object -First 1
+                    $ExoLogs.Add(@{
+                            message       = "Removed owner $($OwnerToRemove.label ?? $Entry.UserPrincipalName ?? $Entry.Id) from $($GroupName) group"
+                            target        = $GroupId
+                            OperationGuid = $OwnersGuid
+                        })
+                    continue
+                }
+                $NewManagedBy.Add($Entry.Id)
+            } else {
+                # Keep unresolved ManagedBy entries so a failed lookup cannot strip an owner.
+                if ($RemoveOwners -and ($RemoveOwners.value -contains $Entry.Input)) {
+                    $OwnerToRemove = $RemoveOwners | Where-Object { $_.value -eq $Entry.Input } | Select-Object -First 1
+                    $ExoLogs.Add(@{
+                            message       = "Removed owner $($OwnerToRemove.label) from $($GroupName) group"
+                            target        = $GroupId
+                            OperationGuid = $OwnersGuid
+                        })
+                    continue
+                }
+                $NewManagedBy.Add($Entry.Input)
             }
+        }
+        foreach ($NewOwner in $AddResolved) {
+            if (-not $NewOwner.Resolved -or -not $NewOwner.Id) { continue }
+            $NewManagedBy.Add($NewOwner.Id)
+            $OwnerLabel = ($AddOwners | Where-Object { $_.value -eq $NewOwner.Input -or $_.value -eq $NewOwner.Id } | Select-Object -First 1).label
+            $ExoLogs.Add(@{
+                    message       = "Added owner $($OwnerLabel ?? $NewOwner.UserPrincipalName ?? $NewOwner.Id) to $($GroupName) group"
+                    target        = $GroupId
+                    OperationGuid = $OwnersGuid
+                })
         }
 
         $NewManagedBy = $NewManagedBy | Sort-Object -Unique
-        $Params = @{ Identity = $GroupId; ManagedBy = $NewManagedBy }
+        # BypassSecurityGroupManagerCheck as everywhere else we write to Exchange: without it the
+        # check applies to mail-enabled security groups and Set-DistributionGroup refuses with
+        # "The executing user is not in the current organization", so owner changes on those groups
+        # silently do nothing. Plain distribution lists are unaffected, which is why this only
+        # showed up on mail-enabled security groups.
+        $Params = @{ Identity = $GroupId; ManagedBy = $NewManagedBy; BypassSecurityGroupManagerCheck = $true }
         $ExoBulkRequests.Add(@{
-                CmdletInput = @{
+                CmdletInput   = @{
                     CmdletName = 'Set-DistributionGroup'
                     Parameters = $Params
                 }
+                OperationGuid = $OwnersGuid
             })
     }
 
 
+
+    # Send As and Send on Behalf only exist on mail-enabled groups
+    if ($GroupType -in @('Distribution List', 'Mail-Enabled Security', 'Microsoft 365')) {
+        foreach ($SendAsChange in @(
+                @{ Action = 'Add'; Items = $UserObj.AddSendAs }
+                @{ Action = 'Remove'; Items = $UserObj.RemoveSendAs }
+            )) {
+            foreach ($Item in @($SendAsChange.Items | Where-Object { $_ })) {
+                $Trustee = $Item.addedFields.userPrincipalName ?? $Item.value ?? $Item
+                $Cmdlet = Set-CIPPMailboxPermission -UserId $GroupId -AccessUser $Trustee -PermissionLevel 'SendAs' -Action $SendAsChange.Action -TenantFilter $TenantId -AsCmdletObject
+                $SendAsGuid = [Guid]::NewGuid().ToString()
+                $ExoBulkRequests.Add(@{
+                        CmdletInput   = @{
+                            CmdletName = $Cmdlet.CmdletName
+                            Parameters = $Cmdlet.Parameters
+                        }
+                        OperationGuid = $SendAsGuid
+                    })
+                $Verb = if ($SendAsChange.Action -eq 'Add') { "Granted $Trustee Send As on" } else { "Removed Send As for $Trustee from" }
+                $ExoLogs.Add(@{
+                        message       = "$Verb $($GroupName) group"
+                        target        = $GroupId
+                        OperationGuid = $SendAsGuid
+                    })
+            }
+        }
+
+        $AddSendOnBehalf = @($UserObj.AddSendOnBehalf | Where-Object { $_ } | ForEach-Object { $_.addedFields.userPrincipalName ?? $_.value ?? $_ })
+        $RemoveSendOnBehalf = @($UserObj.RemoveSendOnBehalf | Where-Object { $_ } | ForEach-Object { $_.addedFields.userPrincipalName ?? $_.value ?? $_ })
+        if ($AddSendOnBehalf.Count -gt 0 -or $RemoveSendOnBehalf.Count -gt 0) {
+            $SendOnBehalfChange = @{ '@odata.type' = '#Exchange.GenericHashTable' }
+            if ($AddSendOnBehalf.Count -gt 0) { $SendOnBehalfChange.add = $AddSendOnBehalf }
+            if ($RemoveSendOnBehalf.Count -gt 0) { $SendOnBehalfChange.remove = $RemoveSendOnBehalf }
+            $Params = @{ Identity = $GroupId; GrantSendOnBehalfTo = $SendOnBehalfChange }
+            if ($GroupType -eq 'Microsoft 365') {
+                $SendOnBehalfCmdlet = 'Set-UnifiedGroup'
+            } else {
+                $SendOnBehalfCmdlet = 'Set-DistributionGroup'
+                $Params.BypassSecurityGroupManagerCheck = $true
+            }
+            # One call carries every Send on Behalf change, so its result is reported once per user
+            $SendOnBehalfGuid = [Guid]::NewGuid().ToString()
+            $ExoBulkRequests.Add(@{
+                    CmdletInput   = @{
+                        CmdletName = $SendOnBehalfCmdlet
+                        Parameters = $Params
+                    }
+                    OperationGuid = $SendOnBehalfGuid
+                })
+            foreach ($User in $AddSendOnBehalf) {
+                $ExoLogs.Add(@{ message = "Granted $User Send on Behalf on $($GroupName) group"; target = $GroupId; OperationGuid = $SendOnBehalfGuid; SendOnBehalf = $true })
+            }
+            foreach ($User in $RemoveSendOnBehalf) {
+                $ExoLogs.Add(@{ message = "Removed Send on Behalf for $User from $($GroupName) group"; target = $GroupId; OperationGuid = $SendOnBehalfGuid; SendOnBehalf = $true })
+            }
+        }
+    }
 
     Write-Information "Graph Bulk Requests: $($BulkRequests.Count)"
     if ($BulkRequests.Count -gt 0) {
@@ -316,7 +489,9 @@ function Invoke-EditGroup {
         foreach ($GraphLog in $GraphLogs) {
             $GraphError = $RawGraphRequest | Where-Object { $_.id -eq $GraphLog.id -and $_.status -notmatch '^2[0-9]+' }
             if ($GraphError) {
-                $Message = Get-NormalizedError -message $GraphError.body.error
+                # body.error is an object; handing it to Get-NormalizedError whole renders it as
+                # "@{code=Request_BadRequest; message=...; innerError=}" in the operator's face.
+                $Message = Get-NormalizedError -message (Get-CippExoErrorText -ErrorRecord $GraphError.body)
                 $Sev = 'Error'
                 $Results.Add("Error - $Message")
             } else {
@@ -336,27 +511,31 @@ function Invoke-EditGroup {
         #Write-Warning 'EditUser - Executing Exo Bulk Requests - Completed'
         #Write-Information ($RawExoRequest | ConvertTo-Json -Depth 10)
 
-        $LastError = $RawExoRequest | Select-Object -Last 1
+        # Match each result back to the operation that produced it. Correlating by hand here used to
+        # report an operation as succeeded whenever the error carried no matching target - which is
+        # exactly what Set-DistributionGroup does - so a rejected owner change was shown to the
+        # operator as "Success - Added owner ..." while nothing had actually happened.
+        $ExoResults = Resolve-CippExoBulkResult -Response $RawExoRequest -Operations $ExoLogs
 
-        foreach ($ExoError in $LastError.error) {
-            $Sev = 'Error'
-            $Results.Add("Error - $ExoError")
-            Write-LogMessage -headers $Headers -API $APIName -tenant $TenantId -message $ExoError -Sev $Sev
-        }
-
-        foreach ($ExoLog in $ExoLogs) {
-            $ExoError = $LastError | Where-Object { $ExoLog.target -in $_.target -and $_.error }
-            if (!$LastError -or ($LastError.error -and $LastError.target -notcontains $ExoLog.target)) {
-                $Message = $ExoLog.message
-                $Sev = 'Info'
-                $Results.Add("Success - $Message")
-                Write-LogMessage -headers $Headers -API $APIName -tenant $TenantId -message $Message -Sev $Sev
+        foreach ($ExoResult in $ExoResults) {
+            if ($ExoResult.Success) {
+                $Results.Add("Success - $($ExoResult.Operation.message)")
+                Write-LogMessage -headers $Headers -API $APIName -tenant $TenantId -message $ExoResult.Operation.message -Sev 'Info'
+            } else {
+                $ErrorText = $ExoResult.ErrorMessage
+                # Send on Behalf only accepts recipients with a mailbox; Exchange reports anything else as not found
+                if ($ExoResult.Operation.SendOnBehalf -and $ErrorText -match 'Couldn''t find object "([^"]+)"') {
+                    $ErrorText = "Send on Behalf was not changed on $($GroupName): $($Matches[1]) has no mailbox. Send on Behalf can only be given to users with a mailbox."
+                }
+                $Results.Add("Error - $ErrorText")
+                Write-LogMessage -headers $Headers -API $APIName -tenant $TenantId -message "$($ExoResult.Operation.message) failed: $($ExoResult.ErrorMessage)" -Sev 'Error'
             }
         }
     }
 
-    # Only process licenses for Security groups
-    if ($GroupType -eq 'Security') {
+    # Group-based licensing works on any security-enabled group: security, mail-enabled security, or a
+    # Microsoft 365 group with securityEnabled. Synced groups too, licenses are cloud-only and not overwritten by sync
+    if ($OrgGroup.securityEnabled -or $GroupType -in @('Security', 'Mail-Enabled Security')) {
         $AddLicenses = @($UserObj.AddLicenses | Where-Object { $_ } | ForEach-Object { $_.value ?? $_ })
         $RemoveLicenses = @($UserObj.RemoveLicenses | Where-Object { $_ } | ForEach-Object { $_.value ?? $_ })
 
@@ -393,10 +572,12 @@ function Invoke-EditGroup {
             $null = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/groups/$($GroupID)" -type PATCH -tenantid $TenantId -body (@{'visibility' = $VisibilityValue } | ConvertTo-Json)
 
             $Results.Add("Set group visibility to $VisibilityValue for $($GroupName).")
+            Write-LogMessage -headers $Headers -API $APIName -tenant $TenantId -message "Set group visibility to $VisibilityValue for $($GroupName)." -Sev 'Info'
         } catch {
             $ErrorMessage = Get-CippException -Exception $_
             Write-Warning "Error in visibility: $($ErrorMessage.NormalizedError) - $($_.InvocationInfo.ScriptLineNumber)"
             $Results.Add("Failed to set group visibility for $($GroupName): $($ErrorMessage.NormalizedError)")
+            Write-LogMessage -headers $Headers -API $APIName -tenant $TenantId -message "Failed to set group visibility for $($GroupName). Error:$($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
         }
     }
 

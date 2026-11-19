@@ -4,6 +4,8 @@ function Invoke-ExecGraphExplorerPreset {
         Entrypoint
     .ROLE
         CIPP.Core.Read
+    .DESCRIPTION
+        Manages the caller's saved Graph Explorer presets. The action field selects the operation: Copy duplicates a preset, Save creates or updates one, and Delete removes one. Save and Delete modify stored data despite the Read role on this endpoint, and a caller may only modify presets they own.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -85,10 +87,10 @@ function Invoke-ExecGraphExplorerPreset {
             Add-CIPPAzDataTableEntity @Table -Entity $Preset -Force
             $Success = $true
         } else {
-            $Entity = Get-CIPPAzDataTableEntity @Table -Filter "RowKey eq '$Id'"
+            $Entity = Get-CIPPAzDataTableEntity @Table -Filter "RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $Id)'"
             if ($Entity.Owner -eq $Username ) {
                 if ($Action -eq 'Delete') {
-                    Remove-AzDataTableEntity -Force @Table -Entity $Entity
+                    Remove-CIPPAzDataTableEntity -Force @Table -Entity $Entity
                 } elseif ($Action -eq 'Save') {
                     Add-CIPPAzDataTableEntity @Table -Entity $Preset -Force
                 }
@@ -104,8 +106,17 @@ function Invoke-ExecGraphExplorerPreset {
     } catch {
         $Success = $false
         $Message = $_.Exception.Message
-        $StatusCode = [HttpStatusCode]::BadRequest
+        $StatusCode = [HttpStatusCode]::InternalServerError
     }
+
+    if ($Action -in @('Save', 'Delete', 'Copy')) {
+        if ($Success) {
+            Write-LogMessage -headers $Headers -API ($Request.Params.CIPPEndpoint) -tenant 'Global' -message $Message -Sev 'Info'
+        } else {
+            Write-LogMessage -headers $Headers -API ($Request.Params.CIPPEndpoint) -tenant 'Global' -message $Message -Sev 'Error'
+        }
+    }
+
     return ([HttpResponseContext]@{
             StatusCode = $StatusCode
             Body       = @{

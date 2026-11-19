@@ -27,7 +27,11 @@ function Set-CIPPSSOEasyAuth {
         [switch]$UseKvReferences,
 
         [Parameter()]
-        [switch]$ImplicitAuth
+        [switch]$ImplicitAuth,
+
+        # Restricted multi-tenant mode: other tenants that may sign in. Empty = any tenant; omitted = keep the current list
+        [Parameter()]
+        [string[]]$AllowedTenants
     )
 
     $SiteName = $env:WEBSITE_SITE_NAME
@@ -61,6 +65,28 @@ function Set-CIPPSSOEasyAuth {
         "https://login.microsoftonline.com/$TenantId/v2.0"
     }
 
+    # Used only for the initial full-overwrite write below. Steady-state ownership of
+    # excludedPaths belongs to Craft's ReconcileAuthPolicy, which enforces the
+    # App.Setup.ExcludedPaths list from the runtime appsettings on every warmup —
+    # so read the same file (it sits one level above CRAFT_ROOT in the container)
+    # and the initial write converges without a reconcile PUT on first boot.
+    $RequiredExcludedPaths = @()
+    try {
+        if ($env:CRAFT_ROOT) {
+            $AppSettingsPath = Join-Path (Split-Path $env:CRAFT_ROOT -Parent) 'appsettings.Production.json'
+            if (Test-Path $AppSettingsPath) {
+                $RequiredExcludedPaths = @((Get-Content $AppSettingsPath -Raw | ConvertFrom-Json).App.Setup.ExcludedPaths)
+            }
+        }
+    } catch {
+        Write-Information "[SSO-EasyAuth] Could not read ExcludedPaths from appsettings: $($_.Exception.Message)"
+    }
+    if ($RequiredExcludedPaths.Count -eq 0) {
+        # Fallback when the appsettings file is unavailable — minimal set the app needs
+        # to function (public webhooks in every emitted casing + the health probe).
+        $RequiredExcludedPaths = @('/api/Public*', '/API/Public*', '/api/public*', '/api/setup/health')
+    }
+
     # Read current app settings and merge AUTH_SECRET
     $CurrentSettings = Invoke-RestMethod -Uri "$BaseUri/config/appsettings/list?api-version=2024-11-01" -Method Post -Headers @{ Authorization = "Bearer $ArmToken" }
     $MergedSettings = @{}
@@ -71,17 +97,24 @@ function Set-CIPPSSOEasyAuth {
     # Set AUTH_SECRET as a KV reference when requested (initial setup)
     # Skip for implicit auth (no client secret needed — e.g. central migration app)
     if ($UseKvReferences -and -not $ImplicitAuth) {
-        $KV = $env:WEBSITE_DEPLOYMENT_ID
-        $VaultName = if ($KV) { ($KV -split '-')[0] } else { $null }
+        $VaultName = Get-CippKeyVaultName
         if ($VaultName) {
             $MergedSettings['AUTH_SECRET'] = "@Microsoft.KeyVault(VaultName=$VaultName;SecretName=SSOAppSecret)"
         }
     }
 
-    # Always remove WEBSITE_AUTH_AAD_ALLOWED_TENANTS — we rely on the issuer URL
-    # for tenant restriction ("Use default restrictions based on issuer" in the portal).
-    # Multi-tenant uses common/v2.0 issuer, single-tenant uses {tenantId}/v2.0.
-    $MergedSettings.Remove('WEBSITE_AUTH_AAD_ALLOWED_TENANTS')
+    # Single tenant is restricted by its {tenantId}/v2.0 issuer. Multi-tenant (common issuer) is restricted
+    # by WEBSITE_AUTH_AAD_ALLOWED_TENANTS, which always lists this tenant so its admins keep access.
+    if (-not $MultiTenant) {
+        $MergedSettings.Remove('WEBSITE_AUTH_AAD_ALLOWED_TENANTS')
+    } elseif ($PSBoundParameters.ContainsKey('AllowedTenants')) {
+        $OtherTenants = @(@($AllowedTenants).Where({ $_ }))
+        if ($OtherTenants.Count -gt 0) {
+            $MergedSettings['WEBSITE_AUTH_AAD_ALLOWED_TENANTS'] = (@(@($TenantId; $OtherTenants).ToLower() | Select-Object -Unique) -join ',')
+        } else {
+            $MergedSettings.Remove('WEBSITE_AUTH_AAD_ALLOWED_TENANTS')
+        }
+    }
 
     $SettingsBody = @{ properties = $MergedSettings } | ConvertTo-Json -Depth 5
     Invoke-RestMethod -Uri "$BaseUri/config/appsettings?api-version=2024-11-01" -Method Put -Headers $ArmHeaders -Body $SettingsBody
@@ -135,10 +168,7 @@ function Set-CIPPSSOEasyAuth {
                 globalValidation  = @{
                     unauthenticatedClientAction = 'RedirectToLoginPage'
                     redirectToProvider          = 'azureactivedirectory'
-                    excludedPaths               = @(
-                        '/api/Public*'
-                        '/api/setup/health'
-                    )
+                    excludedPaths               = $RequiredExcludedPaths
                 }
                 identityProviders = @{
                     azureActiveDirectory = @{

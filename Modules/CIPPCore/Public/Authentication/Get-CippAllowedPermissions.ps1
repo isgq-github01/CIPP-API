@@ -22,30 +22,10 @@ function Get-CippAllowedPermissions {
     )
 
     # Get all available permissions and base roles configuration
-
-    $Version = if ($env:CIPPNG -eq 'true') {
-        $env:APP_VERSION
-    } else {
-        (Get-Content -Path (Join-Path $env:CIPPRootPath 'version_latest.txt')).Trim()
-    }
-    $BaseRoles = Get-Content -Path (Join-Path $env:CIPPRootPath 'Config\cipp-roles.json') | ConvertFrom-Json
+    $BaseRoles = [System.IO.File]::ReadAllText((Join-Path $env:CIPPRootPath 'Config\cipp-roles.json')) | ConvertFrom-Json
     $DefaultRoles = @('superadmin', 'admin', 'editor', 'readonly', 'anonymous', 'authenticated')
 
-    $AllPermissionCacheTable = Get-CIPPTable -tablename 'cachehttppermissions'
-    $AllPermissionsRow = Get-CIPPAzDataTableEntity @AllPermissionCacheTable -Filter "PartitionKey eq 'HttpFunctions' and RowKey eq 'HttpFunctions' and Version eq '$($Version)'"
-
-    if (-not $AllPermissionsRow.Permissions) {
-        $AllPermissions = Get-CIPPHttpFunctions -ByRole | Select-Object -ExpandProperty Permission
-        $Entity = @{
-            PartitionKey = 'HttpFunctions'
-            RowKey       = 'HttpFunctions'
-            Version      = [string]$Version
-            Permissions  = [string]($AllPermissions | ConvertTo-Json -Compress)
-        }
-        Add-CIPPAzDataTableEntity @AllPermissionCacheTable -Entity $Entity -Force
-    } else {
-        $AllPermissions = $AllPermissionsRow.Permissions | ConvertFrom-Json
-    }
+    $AllPermissions = Get-CippHttpPermissions
 
     $AllowedPermissions = [System.Collections.Generic.List[string]]::new()
 
@@ -64,11 +44,11 @@ function Get-CippAllowedPermissions {
     }
 
     if ($PrimaryRole) {
-        $BaseRole = $BaseRoles.PSObject.Properties | Where-Object { $_.Name -eq $PrimaryRole } | Select-Object -First 1
+        $BaseRole = $BaseRoles.PSObject.Properties[$PrimaryRole]
     }
 
     # Get custom roles (non-default roles)
-    $CustomRoles = $UserRoles | Where-Object { $DefaultRoles -notcontains $_ }
+    $CustomRoles = @($UserRoles).Where({ $DefaultRoles -notcontains $_ })
 
     # For admin and superadmin: Compute permissions from base role include/exclude rules
     if ($PrimaryRole -in @('admin', 'superadmin')) {
@@ -79,9 +59,8 @@ function Get-CippAllowedPermissions {
 
             # Apply include rules
             foreach ($Include in $BaseRole.Value.include) {
-                $MatchingPermissions = $AllPermissions | Where-Object { $_ -like $Include }
-                foreach ($Permission in $MatchingPermissions) {
-                    if ($BasePermissions -notcontains $Permission) {
+                foreach ($Permission in $AllPermissions) {
+                    if ($Permission -like $Include -and $BasePermissions -notcontains $Permission) {
                         $BasePermissions.Add($Permission)
                     }
                 }
@@ -89,7 +68,7 @@ function Get-CippAllowedPermissions {
 
             # Apply exclude rules
             foreach ($Exclude in $BaseRole.Value.exclude) {
-                $ExcludedPermissions = $BasePermissions | Where-Object { $_ -like $Exclude }
+                $ExcludedPermissions = @(foreach ($Permission in $BasePermissions) { if ($Permission -like $Exclude) { $Permission } })
                 foreach ($Permission in $ExcludedPermissions) {
                     $BasePermissions.Remove($Permission) | Out-Null
                 }
@@ -110,9 +89,8 @@ function Get-CippAllowedPermissions {
 
             # Apply include rules from base role
             foreach ($Include in $BaseRole.Value.include) {
-                $MatchingPermissions = $AllPermissions | Where-Object { $_ -like $Include }
-                foreach ($Permission in $MatchingPermissions) {
-                    if ($BasePermissions -notcontains $Permission) {
+                foreach ($Permission in $AllPermissions) {
+                    if ($Permission -like $Include -and $BasePermissions -notcontains $Permission) {
                         $BasePermissions.Add($Permission)
                     }
                 }
@@ -120,7 +98,7 @@ function Get-CippAllowedPermissions {
 
             # Apply exclude rules from base role
             foreach ($Exclude in $BaseRole.Value.exclude) {
-                $ExcludedPermissions = $BasePermissions | Where-Object { $_ -like $Exclude }
+                $ExcludedPermissions = @(foreach ($Permission in $BasePermissions) { if ($Permission -like $Exclude) { $Permission } })
                 foreach ($Permission in $ExcludedPermissions) {
                     $BasePermissions.Remove($Permission) | Out-Null
                 }
@@ -189,5 +167,5 @@ function Get-CippAllowedPermissions {
     }
 
     # Return sorted unique permissions
-    return ($AllowedPermissions | Where-Object { $_ -notmatch 'None$' } | Sort-Object -Unique)
+    return (@(foreach ($Permission in $AllowedPermissions) { if ($Permission -notmatch 'None$') { $Permission } }) | Sort-Object -Unique)
 }

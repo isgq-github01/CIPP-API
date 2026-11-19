@@ -26,8 +26,8 @@ function Invoke-ExecTenantGroup {
 
     # Validate dynamic rules to prevent code injection
     if ($groupType -eq 'dynamic' -and $dynamicRules) {
-        $AllowedDynamicOperators = @('eq', 'ne', 'like', 'notlike', 'in', 'notin', 'contains', 'notcontains')
-        $AllowedDynamicProperties = @('delegatedAccessStatus', 'availableLicense', 'availableServicePlan', 'tenantGroupMember', 'customVariable')
+        $AllowedDynamicOperators = @('eq', 'ne', 'like', 'notlike', 'in', 'notin', 'contains', 'notcontains', 'gt', 'ge', 'lt', 'le')
+        $AllowedDynamicProperties = @('delegatedAccessStatus', 'availableLicense', 'availableServicePlan', 'tenantGroupMember', 'customVariable', 'gdapRelationshipAge')
         foreach ($rule in $dynamicRules) {
             if ($rule.operator -and $rule.operator.ToLower() -notin $AllowedDynamicOperators) {
                 return ([HttpResponseContext]@{
@@ -52,11 +52,29 @@ function Invoke-ExecTenantGroup {
             })
     }
 
+    # Onboarding owns this group and finds it by name; the other names are placeholders that baselines and templates treat specially
+    $OnboardingGroupName = 'Excluded onboarded tenants'
+    $ReservedNames = @('AllTenants', 'Exported Template', 'Template Tenant', $OnboardingGroupName)
+    if ($Action -in @('AddEdit', 'Delete')) {
+        $ExistingGroup = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'TenantGroup' and RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $groupId)'"
+        $Refusal = if ($ExistingGroup.Name -eq $OnboardingGroupName) {
+            "'$OnboardingGroupName' is managed by tenant onboarding and can't be edited or deleted."
+        } elseif ($Action -eq 'AddEdit' -and $groupName -in $ReservedNames) {
+            "'$groupName' is a reserved name. Choose a different group name."
+        }
+        if ($Refusal) {
+            return ([HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::BadRequest
+                    Body       = @{ Results = $Refusal }
+                })
+        }
+    }
+
     switch ($Action) {
         'AddEdit' {
             $Results = [System.Collections.Generic.List[object]]::new()
             # Update group details
-            $GroupEntity = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'TenantGroup' and RowKey eq '$groupId'"
+            $GroupEntity = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'TenantGroup' and RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $groupId)'"
             if ($GroupEntity) {
                 if ($groupName) {
                     $GroupEntity.Name = $groupName
@@ -96,7 +114,7 @@ function Invoke-ExecTenantGroup {
 
             if ($groupType -eq 'static') {
                 # Static group - manage members manually
-                $CurrentMembers = Get-CIPPAzDataTableEntity @MembersTable -Filter "PartitionKey eq 'Member' and GroupId eq '$groupId'"
+                $CurrentMembers = Get-CIPPAzDataTableEntity @MembersTable -Filter "PartitionKey eq 'Member' and GroupId eq '$(ConvertTo-CIPPODataFilterValue -Value $groupId)'"
 
                 # Add members
                 foreach ($member in $members) {
@@ -119,7 +137,7 @@ function Invoke-ExecTenantGroup {
                 if ($CurrentMembers -and $null -ne $members) {
                     foreach ($CurrentMember in $CurrentMembers) {
                         if ($members.value -notcontains $CurrentMember.customerId) {
-                            Remove-AzDataTableEntity @MembersTable -Entity $CurrentMember -Force
+                            Remove-CIPPAzDataTableEntity @MembersTable -Entity $CurrentMember -Force
                             $Removes.Add('Removed member {0}' -f $CurrentMember.customerId)
                         }
                     }
@@ -144,14 +162,22 @@ function Invoke-ExecTenantGroup {
                     })
             }
 
+            Write-LogMessage -API 'TenantGroups' -tenant 'Global' -headers $Request.Headers -message "Group '$groupName' saved successfully" -Sev 'Info'
             $Body = @{ Results = $Results }
         }
         'Delete' {
             # Delete group
-            $GroupEntity = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'TenantGroup' and RowKey eq '$groupId'"
+            $GroupEntity = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'TenantGroup' and RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $groupId)'"
             if ($GroupEntity) {
-                Remove-AzDataTableEntity @Table -Entity $GroupEntity -Force
-                $Body = @{ Results = "Group '$($GroupEntity.Name)' deleted successfully" }
+                Remove-CIPPAzDataTableEntity @Table -Entity $GroupEntity -Force
+                $VariablesTable = Get-CippTable -tablename 'CippReplacemap'
+                $GroupVariables = @(Get-CIPPAzDataTableEntity @VariablesTable -Filter "PartitionKey eq 'group:$(ConvertTo-CIPPODataFilterValue -Value $groupId)'")
+                if ($GroupVariables.Count -gt 0) {
+                    Remove-CIPPAzDataTableEntity @VariablesTable -Entity $GroupVariables -Force
+                }
+                $Result = "Group '$($GroupEntity.Name)' deleted successfully"
+                Write-LogMessage -API 'TenantGroups' -tenant 'Global' -headers $Request.Headers -message $Result -Sev 'Info'
+                $Body = @{ Results = $Result }
             } else {
                 $Body = @{ Results = "Group '$groupId' not found" }
             }
@@ -159,6 +185,12 @@ function Invoke-ExecTenantGroup {
         default {
             $Body = @{ Results = 'Invalid action' }
         }
+    }
+
+    # Roles can be scoped to a tenant group, so changing membership changes what those roles
+    # resolve to and the cached scope rules have to be rebuilt
+    if ($Action -in @('AddEdit', 'Delete')) {
+        Clear-CippAccessScopeCache
     }
 
     return ([HttpResponseContext]@{

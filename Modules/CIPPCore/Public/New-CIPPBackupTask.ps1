@@ -27,12 +27,19 @@ function New-CIPPBackupTask {
         }
         'users' {
             Measure-CippTask -TaskName 'Users' -EventName 'CIPP.BackupCompleted' -Script {
-                New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/users?$top=999' -tenantid $TenantFilter | Select-Object * -ExcludeProperty mail, provisionedPlans, onPrem*, *passwordProfile*, *serviceProvisioningErrors*, isLicenseReconciliationNeeded, isManagementRestricted, isResourceAccount, *date*, *external*, identities, deletedDateTime, isSipEnabled, assignedPlans, cloudRealtimeCommunicationInfo, deviceKeys, provisionedPlan, securityIdentifier | ForEach-Object {
-                    #remove the property if the value is $null
-                    $_.psobject.properties | Where-Object { $null -eq $_.Value } | ForEach-Object {
-                        $_.psobject.properties.Remove($_.Name)
+                $ExcludedProperties = @('mail', 'provisionedPlans', 'onPrem*', '*passwordProfile*', '*serviceProvisioningErrors*', 'isLicenseReconciliationNeeded', 'isManagementRestricted', 'isResourceAccount', '*date*', '*external*', 'identities', 'deletedDateTime', 'imAddresses', 'isSipEnabled', 'assignedPlans', 'cloudRealtimeCommunicationInfo', 'deviceKeys', 'provisionedPlan', 'securityIdentifier')
+                $KeepProperty = @{}
+                foreach ($User in (New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/users?$top=999' -tenantid $TenantFilter)) {
+                    $Kept = [ordered]@{}
+                    foreach ($Property in $User.PSObject.Properties) {
+                        $Keep = $KeepProperty[$Property.Name]
+                        if ($null -eq $Keep) {
+                            $Name = $Property.Name
+                            $Keep = $KeepProperty[$Name] = -not $ExcludedProperties.Where({ $Name -like $_ }, 'First')
+                        }
+                        if ($Keep) { $Kept[$Property.Name] = $Property.Value }
                     }
-                    $_
+                    [pscustomobject]$Kept
                 }
             }
         }
@@ -65,6 +72,7 @@ function New-CIPPBackupTask {
                     'https://graph.microsoft.com/beta/deviceManagement/windowsFeatureUpdateProfiles'
                     'https://graph.microsoft.com/beta/deviceManagement/windowsQualityUpdatePolicies'
                     'https://graph.microsoft.com/beta/deviceManagement/windowsQualityUpdateProfiles'
+                    'https://graph.microsoft.com/beta/deviceManagement/hardwareConfigurations'
                 )
 
                 foreach ($url in $GraphURLS) {
@@ -96,7 +104,9 @@ function New-CIPPBackupTask {
         'intuneprotection' {
             Measure-CippTask -TaskName 'IntuneProtection' -EventName 'CIPP.BackupCompleted' -Script {
                 New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/deviceAppManagement/managedAppPolicies?$top=999' -tenantid $TenantFilter | ForEach-Object {
-                    New-CIPPIntuneTemplate -TenantFilter $TenantFilter -URLName 'managedAppPolicies' -ID $_.ID
+                    # The listing is the only place the concrete type is visible; without it the
+                    # capture reads back a policy that does not say which platform it is for.
+                    New-CIPPIntuneTemplate -TenantFilter $TenantFilter -URLName 'managedAppPolicies' -ID $_.ID -ODataType $_.'@odata.type'
                 }
             }
         }
@@ -141,6 +151,16 @@ function New-CIPPBackupTask {
             }
         }
 
+        'teamsvoice' {
+            Measure-CippTask -TaskName 'TeamsVoice' -EventName 'CIPP.BackupCompleted' -Script {
+                # Keep only what assignNumber can recreate: numbers held by a user or resource account.
+                # Unassigned numbers carry nothing to restore; policyAssigned targets a shared-calling policy.
+                New-GraphGetRequest -uri 'https://graph.microsoft.com/v1.0/admin/teams/telephoneNumberManagement/numberAssignments' -tenantid $TenantFilter |
+                    Where-Object { $_.assignmentStatus -in @('userAssigned', 'voiceApplicationAssigned') -and $_.assignmentTargetId } |
+                    Select-Object telephoneNumber, assignmentTargetId, assignmentStatus, assignmentCategory, numberType, locationId
+            }
+        }
+
         'CippWebhookAlerts' {
             Measure-CippTask -TaskName 'WebhookAlerts' -EventName 'CIPP.BackupCompleted' -Script {
                 $WebhookTable = Get-CIPPTable -TableName 'WebhookRules'
@@ -150,7 +170,7 @@ function New-CIPPBackupTask {
         'CippScriptedAlerts' {
             Measure-CippTask -TaskName 'ScriptedAlerts' -EventName 'CIPP.BackupCompleted' -Script {
                 $ScheduledTasks = Get-CIPPTable -TableName 'ScheduledTasks'
-                Get-CIPPAzDataTableEntity @ScheduledTasks | Where-Object { $_.hidden -eq $true -and $_.command -like 'Get-CippAlert*' -and $TenantFilter -in $_.Tenant }
+                Get-CIPPAzDataTableEntity @ScheduledTasks -Filter "PartitionKey eq 'ScheduledTask' and (Hidden eq true or Hidden eq 'True')" | Where-Object { $_.command -like 'Get-CippAlert*' -and $TenantFilter -in $_.Tenant }
             }
         }
     }

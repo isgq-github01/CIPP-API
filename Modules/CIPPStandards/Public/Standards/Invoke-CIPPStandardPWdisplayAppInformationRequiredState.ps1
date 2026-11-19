@@ -22,12 +22,8 @@ function Invoke-CIPPStandardPWdisplayAppInformationRequiredState {
             "EIDSCA.AM10"
             "NIST CSF 2.0 (PR.AA-03)"
             "EIDSCAAM01"
-            "EIDSCAAM03"
-            "EIDSCAAM04"
             "EIDSCAAM06"
             "EIDSCAAM07"
-            "EIDSCAAM09"
-            "EIDSCAAM10"
         EXECUTIVETEXT
             Enhances authentication security by requiring users to match numbers and showing detailed information about login requests, including application names and location data. This helps employees verify legitimate login attempts and prevents unauthorized access through more secure authentication methods.
         ADDEDCOMPONENT
@@ -55,8 +51,8 @@ function Invoke-CIPPStandardPWdisplayAppInformationRequiredState {
         return
     }
 
+    # numberMatchingRequiredState is not graded: it is permanently enabled by Microsoft and can no longer be toggled
     $StateIsCorrect = ($CurrentState.state -eq 'enabled') -and
-    ($CurrentState.featureSettings.numberMatchingRequiredState.state -eq 'enabled') -and
     ($CurrentState.featureSettings.displayAppInformationRequiredState.state -eq 'enabled')
 
     if ($Settings.remediate -eq $true) {
@@ -64,8 +60,10 @@ function Invoke-CIPPStandardPWdisplayAppInformationRequiredState {
             Write-LogMessage -API 'Standards' -tenant $tenant -message 'Passwordless with Information and Number Matching is already enabled.' -sev Info
         } else {
             try {
-                Set-CIPPAuthenticationPolicy -Tenant $tenant -APIName 'Standards' -AuthenticationMethodId 'MicrosoftAuthenticator' -Enabled $true
+                Set-CIPPAuthenticationPolicy -Tenant $tenant -APIName 'Standards' -AuthenticationMethodId 'MicrosoftAuthenticator' -Enabled $true -MicrosoftAuthenticatorDisplayAppInfo 'enabled'
             } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API 'Standards' -tenant $tenant -message "Failed to enable Passwordless with Information and Number Matching. Error: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
             }
         }
     }
@@ -80,15 +78,12 @@ function Invoke-CIPPStandardPWdisplayAppInformationRequiredState {
     }
 
     if ($Settings.report -eq $true) {
-        Add-CIPPBPAField -FieldName 'PWdisplayAppInformationRequiredState' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $tenant
         $CurrentValue = @{
             state                              = $CurrentState.state
-            numberMatchingRequiredState        = $CurrentState.featureSettings.numberMatchingRequiredState.state
             displayAppInformationRequiredState = $CurrentState.featureSettings.displayAppInformationRequiredState.state
         }
         $ExpectedValue = @{
             state                              = 'enabled'
-            numberMatchingRequiredState        = 'enabled'
             displayAppInformationRequiredState = 'enabled'
         }
         Set-CIPPStandardsCompareField -FieldName 'standards.PWdisplayAppInformationRequiredState' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $tenant

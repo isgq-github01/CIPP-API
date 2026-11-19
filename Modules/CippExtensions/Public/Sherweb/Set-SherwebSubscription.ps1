@@ -18,18 +18,28 @@ function Set-SherwebSubscription {
         $Config = $ExtensionConfig.Sherweb
 
         $AllowedRoles = $Config.AllowedCustomRoles.value
-        if ($AllowedRoles -and $Headers.'x-ms-client-principal') {
-            $UserRoles = Get-CIPPAccessRole -Headers $Headers
+        if ($AllowedRoles) {
+            # Resolve caller roles for both interactive users and direct API clients,
+            # mirroring the principal detection Test-CIPPAccess/Test-CippApiClientRoleGrant use.
+            if ($Headers.'x-ms-client-principal-idp' -eq 'aad' -and $Headers.'x-ms-client-principal-name' -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+                $Client = Get-CippApiClient -AppId $Headers.'x-ms-client-principal-name'
+                $CallerRoles = if ($Client.Role) { @($Client.Role) } else { @('cipp-api') }
+            } elseif ($Headers.'x-ms-client-principal') {
+                $CallerRoles = @(Get-CIPPAccessRole -Headers $Headers)
+            } else {
+                $CallerRoles = @()
+            }
+
             $Allowed = $false
-            foreach ($Role in $UserRoles) {
+            foreach ($Role in $CallerRoles) {
                 if ($AllowedRoles -contains $Role) {
-                    Write-Information "User has allowed CIPP role: $Role"
+                    Write-Information "Caller has allowed CIPP role: $Role"
                     $Allowed = $true
                     break
                 }
             }
             if (-not $Allowed) {
-                throw 'This user is not allowed to modify Sherweb subscriptions.'
+                throw 'This caller is not allowed to modify Sherweb subscriptions.'
             }
         }
     }
@@ -75,6 +85,20 @@ function Set-SherwebSubscription {
             $FinalQuantity = $CurrentQuantity - $Remove
             if ($FinalQuantity -lt 0) {
                 throw "Cannot remove more licenses than currently allocated. Current: $CurrentQuantity, Attempting to remove: $Remove."
+            }
+
+            # Committed subscriptions (NCE) can only be decreased in the days right after a purchase or
+            # renewal. Sherweb publishes the current floor; refuse up front with a plain explanation
+            # rather than relaying the raw 412 commitment-term-violations error.
+            $Minimum = Get-SherwebMinimumQuantity -Subscription $ExistingSubscription[0]
+            if ($Minimum -and $FinalQuantity -lt $Minimum.MinimumQuantity) {
+                $ProductName = $ExistingSubscription[0].productName
+                $RenewalText = if ($Minimum.RenewsOn) { " The term next renews on $($Minimum.RenewsOn.ToString('yyyy-MM-dd'))." } else { '' }
+                if ($Minimum.MinimumQuantity -ge $CurrentQuantity) {
+                    throw "Sherweb will not accept this decrease: '$ProductName' is on a $($Minimum.TermType) commitment term and its quantity of $CurrentQuantity is locked until the term renews. Committed subscriptions can only be decreased in the first days after a purchase or renewal.$RenewalText Use the 'Schedule decrease at next renewal' action to run the decrease just after that date."
+                }
+                $UntilText = if ($Minimum.AllowedUntil) { " until $($Minimum.AllowedUntil.ToString('yyyy-MM-dd'))" } else { '' }
+                throw "Sherweb will not accept this decrease: '$ProductName' is on a $($Minimum.TermType) commitment term and can currently only be decreased to $($Minimum.MinimumQuantity) license(s)$UntilText, not to $FinalQuantity. Committed subscriptions can only be decreased in the first days after a purchase or renewal.$RenewalText"
             }
         } else {
             if (-not $Quantity -or $Quantity -le 0) {

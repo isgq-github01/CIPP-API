@@ -25,7 +25,9 @@ function Invoke-CippTestZTNA21899 {
             foreach ($R in $NotifRules) {
                 if (-not $R.notificationRecipients -or $R.notificationRecipients.Count -eq 0) {
                     $MissingRecipients.Add([PSCustomObject]@{
-                            PolicyId           = $Policy.id
+                            # 'policyId' — this type is sourced from roleManagementPolicyAssignments
+                            # and carries the policy's id as policyId, not id.
+                            PolicyId           = $Policy.policyId
                             ScopeId            = $Policy.scopeId
                             ScopeType          = $Policy.scopeType
                             RuleId             = $R.id
@@ -47,7 +49,7 @@ function Invoke-CippTestZTNA21899 {
             $Lines.Add('')
             $Lines.Add('| Policy / Scope | Rule | Level | Type | Recipient Type |')
             $Lines.Add('| :------------- | :--- | :---- | :--- | :------------- |')
-            foreach ($M in ($MissingRecipients | Select-Object -First 25)) {
+            foreach ($M in $MissingRecipients.Where({ $true }, 'First', 25)) {
                 $Lines.Add("| $($M.ScopeType):$($M.ScopeId) | $($M.RuleId) | $($M.NotificationLevel) | $($M.NotificationType) | $($M.RecipientType) |")
             }
             if ($MissingRecipients.Count -gt 25) {

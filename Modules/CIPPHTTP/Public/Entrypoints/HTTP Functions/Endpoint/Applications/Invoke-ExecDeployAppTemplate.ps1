@@ -13,12 +13,16 @@ function Invoke-ExecDeployAppTemplate {
 
     try {
         $TemplateId = $Request.Body.templateId
-        if (!$TemplateId) { throw 'No template ID provided' }
+        if (!$TemplateId) {
+            return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::BadRequest; Body = @{ Results = @('Failed to deploy app template: No template ID provided') } })
+        }
 
         $Table = Get-CippTable -tablename 'templates'
-        $Filter = "PartitionKey eq 'AppTemplate' and RowKey eq '$TemplateId'"
+        $Filter = "PartitionKey eq 'AppTemplate' and RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $TemplateId)'"
         $TemplateEntity = Get-CIPPAzDataTableEntity @Table -Filter $Filter
-        if (!$TemplateEntity) { throw 'Template not found' }
+        if (!$TemplateEntity) {
+            return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::NotFound; Body = @{ Results = @('Failed to deploy app template: Template not found') } })
+        }
 
         $TemplateData = $TemplateEntity.JSON | ConvertFrom-Json -Depth 100
         $AppsRaw = $TemplateData.Apps
@@ -29,12 +33,18 @@ function Invoke-ExecDeployAppTemplate {
         $AppNames = @($AppsRaw.appName)
         $AppConfigs = @($AppsRaw.config)
 
+        # Deploys only the application with this name instead of the whole template
+        $OnlyApp = [string]$Request.Body.appName
         for ($i = 0; $i -lt $AppTypes.Count; $i++) {
+            if ($OnlyApp -and [string]$AppNames[$i] -ne $OnlyApp) { continue }
             $Apps.Add([PSCustomObject]@{
                 appType = [string]$AppTypes[$i]
                 appName = [string]$AppNames[$i]
                 config  = [string]$AppConfigs[$i]
             })
+        }
+        if ($Apps.Count -eq 0) {
+            return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::NotFound; Body = @{ Results = @("Failed to deploy app template: '$OnlyApp' is not in the template") } })
         }
 
         $SelectedTenants = @($Request.Body.selectedTenants | ForEach-Object {
@@ -47,25 +57,32 @@ function Invoke-ExecDeployAppTemplate {
         $OverrideAssignTo = $Request.Body.AssignTo
         $OverrideCustomGroup = $Request.Body.customGroup
 
+        $Failed = 0
         $Results = foreach ($App in $Apps) {
             try {
                 $Config = $App.config
                 if ($Config -is [string]) {
-                    $Config = $Config | ConvertFrom-Json -Depth 100
+                    $Config = $Config | ConvertFrom-CippAppConfig
                 }
 
                 $AppType = "$($App.appType ?? $App.AppType)"
 
                 $RequestBody = $Config | ConvertTo-Json -Depth 100 | ConvertFrom-Json -Depth 100
-                $RequestBody | Add-Member -NotePropertyName 'selectedTenants' -NotePropertyValue $SelectedTenants -Force
-                $RequestBody | Add-Member -NotePropertyName 'tenantFilter' -NotePropertyValue 'allTenants' -Force
-
+                $RequestProps = [ordered]@{
+                    selectedTenants = $SelectedTenants
+                    tenantFilter    = 'allTenants'
+                }
                 if ($OverrideAssignTo) {
-                    $RequestBody | Add-Member -NotePropertyName 'AssignTo' -NotePropertyValue $OverrideAssignTo -Force
+                    $RequestProps['AssignTo'] = $OverrideAssignTo
                     if ($OverrideAssignTo -eq 'customGroup' -and $OverrideCustomGroup) {
-                        $RequestBody | Add-Member -NotePropertyName 'CustomGroup' -NotePropertyValue $OverrideCustomGroup -Force
+                        $RequestProps['CustomGroup'] = $OverrideCustomGroup
+                    }
+                    # Groups picked by id from a single tenant, and exclusions, sent with the override replace the template's
+                    foreach ($Field in 'GroupIds', 'excludeGroup', 'ExcludeGroupIds') {
+                        if ($Request.Body.$Field) { $RequestProps[$Field] = $Request.Body.$Field }
                     }
                 }
+                $RequestBody | Add-Member -NotePropertyMembers $RequestProps -Force
 
                 $MockRequest = [PSCustomObject]@{
                     Body    = $RequestBody
@@ -80,27 +97,57 @@ function Invoke-ExecDeployAppTemplate {
                     'officeApp'      { Invoke-AddOfficeApp -Request $MockRequest -TriggerMetadata $null }
                     'win32ScriptApp' { Invoke-AddWin32ScriptApp -Request $MockRequest -TriggerMetadata $null }
                     'mspApp'         { Invoke-AddMSPApp -Request $MockRequest -TriggerMetadata $null }
+                    'edgeApp'        { Invoke-AddEdgeApp -Request $MockRequest -TriggerMetadata $null }
+                    { $_ -in @('win32PackageApp', 'macOSPackageApp') } {
+                        $QueueTable = Get-CippTable -tablename 'apps'
+                        $QueueTable.Force = $true
+                        $RequestBody | Add-Member -Force -NotePropertyMembers ([ordered]@{
+                                type            = $AppType -eq 'macOSPackageApp' ? 'MacOSPackageApp' : 'Win32PackageApp'
+                                Applicationname = "$($RequestBody.applicationName ?? $App.appName)"
+                                assignTo        = $RequestBody.AssignTo -eq 'customGroup' ? $RequestBody.CustomGroup : $RequestBody.AssignTo
+                                tenant          = $null
+                            })
+                        $Queued = foreach ($Tenant in (Resolve-CippBulkSelectedTenant -Request $MockRequest -SelectedTenants $SelectedTenants).defaultDomainName) {
+                            $RequestBody.tenant = $Tenant
+                            Add-CIPPAzDataTableEntity @QueueTable -Entity @{ JSON = [string]($RequestBody | ConvertTo-Json -Depth 15 -Compress); RowKey = [string](New-Guid); PartitionKey = 'apps'; status = 'Not Deployed yet' }
+                            "Queued '$($App.appName)' for $Tenant"
+                        }
+                        [PSCustomObject]@{ StatusCode = [HttpStatusCode]::OK; Body = @{ Results = @($Queued) } }
+                    }
                     default          { throw "Unknown app type: $AppType" }
                 }
 
-                if ($HandlerResult.Body.Results) {
+                $DeployedResult = if ($HandlerResult.Body.Results) {
                     $HandlerResult.Body.Results
                 } elseif ($HandlerResult.Body) {
                     $HandlerResult.Body
                 } else {
                     "Queued '$($App.appName)'"
                 }
+
+                # Handlers signal rejection by status code, not by throwing.
+                $HandlerStatus = [int]$HandlerResult.StatusCode
+                if ($HandlerStatus -ge 200 -and $HandlerStatus -lt 300) {
+                    Write-LogMessage -headers $Headers -API $APIName -message "Deployed app '$($App.appName)' ($AppType) from template $TemplateId" -Sev 'Info'
+                    $DeployedResult
+                } else {
+                    $Failed++
+                    $FailureText = "Failed to deploy app '$($App.appName)' ($AppType) from template $($TemplateId): $($DeployedResult -join '; ')"
+                    Write-LogMessage -headers $Headers -API $APIName -message $FailureText -Sev 'Error'
+                    $FailureText
+                }
             } catch {
+                $Failed++
                 $ErrorMessage = Get-CippException -Exception $_
-                "Failed '$($App.appName)': $($ErrorMessage.NormalizedMessage)"
-                Write-LogMessage -headers $Headers -API $APIName -message "Failed to deploy app '$($App.appName)' from template: $($ErrorMessage.NormalizedMessage)" -Sev 'Error' -LogData $ErrorMessage
+                "Failed '$($App.appName)': $($ErrorMessage.NormalizedError)"
+                Write-LogMessage -headers $Headers -API $APIName -message "Failed to deploy app '$($App.appName)' from template: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
             }
         }
 
-        $StatusCode = [HttpStatusCode]::OK
+        $StatusCode = Get-CippBulkStatusCode -Total $Apps.Count -Failed $Failed
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
-        $Results = "Failed to deploy app template: $($ErrorMessage.NormalizedMessage)"
+        $Results = "Failed to deploy app template: $($ErrorMessage.NormalizedError)"
         Write-LogMessage -headers $Headers -API $APIName -message $Results -Sev 'Error' -LogData $ErrorMessage
         $StatusCode = [HttpStatusCode]::InternalServerError
     }

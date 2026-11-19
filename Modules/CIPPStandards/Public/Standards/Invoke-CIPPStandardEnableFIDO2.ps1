@@ -23,9 +23,6 @@ function Invoke-CIPPStandardEnableFIDO2 {
             "EIDSCAAF01"
             "EIDSCAAF02"
             "EIDSCAAF03"
-            "EIDSCAAF04"
-            "EIDSCAAF05"
-            "EIDSCAAF06"
         EXECUTIVETEXT
             Enables support for hardware security keys (like YubiKey) that provide the highest level of authentication security. These physical devices prevent phishing attacks and credential theft, offering superior protection for high-value accounts and sensitive business operations.
         ADDEDCOMPONENT
@@ -61,6 +58,8 @@ function Invoke-CIPPStandardEnableFIDO2 {
             try {
                 Set-CIPPAuthenticationPolicy -Tenant $tenant -APIName 'Standards' -AuthenticationMethodId 'Fido2' -Enabled $true
             } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API 'Standards' -tenant $tenant -message "Failed to enable FIDO2 Support. Error: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
             }
         }
     }
@@ -83,6 +82,5 @@ function Invoke-CIPPStandardEnableFIDO2 {
             EnableFIDO2 = $true
         }
         Set-CIPPStandardsCompareField -FieldName 'standards.EnableFIDO2' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
-        Add-CIPPBPAField -FieldName 'EnableFIDO2' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $tenant
     }
 }

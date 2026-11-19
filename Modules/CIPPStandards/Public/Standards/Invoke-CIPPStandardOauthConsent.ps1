@@ -7,8 +7,8 @@ function Invoke-CIPPStandardOauthConsent {
     .SYNOPSIS
         (Label) Require admin consent for applications (Prevent OAuth phishing)
     .DESCRIPTION
-        (Helptext) Disables users from being able to consent to applications, except for those specified in the field below
-        (DocsDescription) Requires users to get administrator consent before sharing data with applications. You can preapprove specific applications.
+        (Helptext) Disables users from being able to consent to applications, except for those specified in the field below. This standard conflicts with the "Allow users to consent to applications with low security risk" standard; only one of the two should be assigned per tenant.
+        (DocsDescription) Requires users to get administrator consent before sharing data with applications. You can preapprove specific applications. This standard conflicts with the "Allow users to consent to applications with low security risk" (OauthConsentLowSec) standard. Enabling both on the same tenant causes a remediation conflict, so only assign one.
     .NOTES
         CAT
             Entra (AAD) Standards
@@ -19,14 +19,8 @@ function Invoke-CIPPStandardOauthConsent {
             "EIDSCA.AP09"
             "Essential 8 (1175)"
             "NIST CSF 2.0 (PR.AA-05)"
-            "ZTNA21772"
-            "ZTNA21774"
-            "ZTNA21807"
             "EIDSCAAP08"
-            "EIDSCAAP09"
-            "EIDSCACP01"
-            "EIDSCACP03"
-            "EIDSCACP04"
+            "ZTNA21776"
         EXECUTIVETEXT
             Requires administrative approval before employees can grant applications access to company data, preventing unauthorized data sharing and potential security breaches. This protects against malicious applications while allowing approved business tools to function normally.
         ADDEDCOMPONENT
@@ -64,9 +58,17 @@ function Invoke-CIPPStandardOauthConsent {
     } catch {
         $CompareIncludes = @()
     }
-    $StateIsCorrect = if ($State.permissionGrantPolicyIdsAssignedToDefaultUserRole -eq 'ManagePermissionGrantsForSelf.cipp-consent-policy') { $true } else { $false }
+    # The list also carries ManagePermissionGrantsForOwnedResource.* (Teams/chat RSC) entries, so only
+    # the user consent (ManagePermissionGrantsForSelf.*) entries are compared and replaced.
+    $StateIsCorrect = ((@($State.permissionGrantPolicyIdsAssignedToDefaultUserRole) -like 'ManagePermissionGrantsForSelf.*') -join ',') -eq 'ManagePermissionGrantsForSelf.cipp-consent-policy'
 
-    if ($Settings.remediate -eq $true) {
+    $Standards = Get-CIPPStandards -Tenant $tenant
+    $ConflictingStandard = $Standards | Where-Object -Property Standard -EQ 'OauthConsentLowSec'
+
+    if ($Settings.remediate -eq $true -and $ConflictingStandard -and $State.permissionGrantPolicyIdsAssignedToDefaultUserRole -contains 'ManagePermissionGrantsForSelf.microsoft-user-default-low') {
+        # A conflicting low security OAuth consent standard is enabled and currently applied. Skip remediation so we don't fight the other standard, but still fall through to alert/report.
+        Write-LogMessage -API 'Standards' -tenant $tenant -message 'There is a conflicting OAuth Consent policy standard enabled for this tenant. Remove the Allow users to consent to applications with low security risk (Prevent OAuth phishing. Lower impact, less secure) standard from this tenant to apply the require admin consent standard.' -sev Error
+    } elseif ($Settings.remediate -eq $true) {
         $DidRemediationChange = $false
         try {
             if (-not $CompareIncludesFetched) {
@@ -114,8 +116,10 @@ function Invoke-CIPPStandardOauthConsent {
                 "Could not add exclusions, probably already exist: $($_)"
             }
 
-            if ($State.permissionGrantPolicyIdsAssignedToDefaultUserRole -notin @('ManagePermissionGrantsForSelf.cipp-consent-policy')) {
-                New-GraphPostRequest -tenantid $tenant -Uri 'https://graph.microsoft.com/beta/policies/authorizationPolicy/authorizationPolicy' -Type PATCH -Body '{"permissionGrantPolicyIdsAssignedToDefaultUserRole":["ManagePermissionGrantsForSelf.cipp-consent-policy"]}' -ContentType 'application/json'
+            if (-not $StateIsCorrect) {
+                $GrantPolicies = @($State.permissionGrantPolicyIdsAssignedToDefaultUserRole | Where-Object { $_ -and $_ -notlike 'ManagePermissionGrantsForSelf.*' }) + 'ManagePermissionGrantsForSelf.cipp-consent-policy'
+                $Body = @{ permissionGrantPolicyIdsAssignedToDefaultUserRole = @($GrantPolicies) } | ConvertTo-Json -Compress
+                New-GraphPostRequest -tenantid $tenant -Uri 'https://graph.microsoft.com/beta/policies/authorizationPolicy/authorizationPolicy' -Type PATCH -Body $Body -ContentType 'application/json'
                 $DidRemediationChange = $true
             }
 
@@ -123,7 +127,7 @@ function Invoke-CIPPStandardOauthConsent {
                 try {
                     $State = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/policies/authorizationPolicy/authorizationPolicy' -tenantid $tenant
                     $CompareIncludes = @(New-GraphGetRequest -tenantid $tenant -Uri 'https://graph.microsoft.com/beta/policies/permissionGrantPolicies/cipp-consent-policy/includes')
-                    $StateIsCorrect = if ($State.permissionGrantPolicyIdsAssignedToDefaultUserRole -eq 'ManagePermissionGrantsForSelf.cipp-consent-policy') { $true } else { $false }
+                    $StateIsCorrect = ((@($State.permissionGrantPolicyIdsAssignedToDefaultUserRole) -like 'ManagePermissionGrantsForSelf.*') -join ',') -eq 'ManagePermissionGrantsForSelf.cipp-consent-policy'
                 } catch {
                     Write-LogMessage -API 'Standards' -tenant $tenant -message 'Unable to refresh OauthConsent state/includes after remediation.' -sev Warning
                 }
@@ -214,14 +218,22 @@ function Invoke-CIPPStandardOauthConsent {
             }
         }
 
-        $StateIsCorrect = ($State.permissionGrantPolicyIdsAssignedToDefaultUserRole -eq 'ManagePermissionGrantsForSelf.cipp-consent-policy') -and $IncludesAreConfigured
+        $SelfPolicies = @(@($State.permissionGrantPolicyIdsAssignedToDefaultUserRole) -like 'ManagePermissionGrantsForSelf.*')
+        $StateIsCorrect = (($SelfPolicies -join ',') -eq 'ManagePermissionGrantsForSelf.cipp-consent-policy') -and $IncludesAreConfigured
 
-        Add-CIPPBPAField -FieldName 'OauthConsent' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $tenant
 
         $CurrentValue = @{
-            permissionGrantPolicyIdsAssignedToDefaultUserRole = $State.permissionGrantPolicyIdsAssignedToDefaultUserRole
+            permissionGrantPolicyIdsAssignedToDefaultUserRole = $SelfPolicies
             includes = $CurrentIncludesForCompare
         }
+        # Add conflicting standard info if applicable
+        if ($ConflictingStandard) {
+            $CurrentValue.conflictingStandard = @{
+                name       = $ConflictingStandard.Standard
+                templateid = $ConflictingStandard.TemplateId
+            }
+        }
+
         $ExpectedValue = @{
             permissionGrantPolicyIdsAssignedToDefaultUserRole = @('ManagePermissionGrantsForSelf.cipp-consent-policy')
             includes = $ExpectedIncludesForCompare

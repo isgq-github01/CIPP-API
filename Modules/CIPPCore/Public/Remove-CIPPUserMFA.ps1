@@ -12,8 +12,14 @@ function Remove-CIPPUserMFA {
     .PARAMETER TenantFilter
     Tenant where the user resides
 
+    .PARAMETER MethodId
+    Id of a single authentication method to remove. When omitted, all removable methods are removed.
+
     .EXAMPLE
     Remove-CIPPUserMFA -UserPrincipalName testuser@contoso.com -TenantFilter contoso.com
+
+    .EXAMPLE
+    Remove-CIPPUserMFA -UserPrincipalName testuser@contoso.com -TenantFilter contoso.com -MethodId 3179e48a-750b-4051-897c-87b9720928f7
 
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -23,14 +29,19 @@ function Remove-CIPPUserMFA {
         [Parameter(Mandatory = $true)]
         [string]$TenantFilter,
         [Parameter(Mandatory = $false)]
+        [string]$MethodId,
+        [Parameter(Mandatory = $false)]
         $Headers,
         [Parameter(Mandatory = $false)]
         $APIName = 'Remove MFA Methods'
     )
 
+    # Guest UPNs contain '#EXT#'; unencoded, the '#' starts a URI fragment and truncates the Graph path.
+    $EncodedUser = [System.Uri]::EscapeDataString($UserPrincipalName)
+
     Write-Information "Getting auth methods for $UserPrincipalName"
     try {
-        $AuthMethods = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/users/$UserPrincipalName/authentication/methods" -tenantid $TenantFilter -AsApp $true
+        $AuthMethods = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/users/$EncodedUser/authentication/methods" -tenantid $TenantFilter -AsApp $true
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         $Message = "Failed to get MFA methods for user $UserPrincipalName. Error: $($ErrorMessage.NormalizedError)"
@@ -40,8 +51,41 @@ function Remove-CIPPUserMFA {
 
     $RemovableMethods = $AuthMethods | Where-Object { $_.'@odata.type' -and $_.'@odata.type' -ne '#microsoft.graph.passwordAuthenticationMethod' }
 
+    if ($MethodId) {
+        $RemovableMethods = $RemovableMethods | Where-Object { $_.id -eq $MethodId }
+    } elseif (($RemovableMethods | Measure-Object).Count -gt 1) {
+        # Graph refuses the default method while others remain and a mobile while an alternate mobile remains, so the default goes last
+        $SignInPreferencesUri = "https://graph.microsoft.com/beta/users/$EncodedUser/authentication/signInPreferences"
+        $Preferred = try { (New-GraphGetRequest -uri $SignInPreferencesUri -tenantid $TenantFilter -AsApp $true).userPreferredMethodForSecondaryAuthentication } catch { $null }
+        if ($Preferred -in @('voiceAlternateMobile', 'voiceOffice') -and ($RemovableMethods | Where-Object { $_.phoneType -eq 'mobile' })) {
+            # The authentication methods policy may allow only one of text or voice
+            foreach ($MobilePreference in 'sms', 'voiceMobile') {
+                try {
+                    $null = New-GraphPOSTRequest -uri $SignInPreferencesUri -tenantid $TenantFilter -type PATCH -body (ConvertTo-Json -Compress -InputObject @{ userPreferredMethodForSecondaryAuthentication = $MobilePreference }) -AsApp $true
+                    $Preferred = $MobilePreference
+                    break
+                } catch {
+                    Write-Information "Could not move the default MFA method to $MobilePreference for $UserPrincipalName`: $($_.Exception.Message)"
+                }
+            }
+        }
+        $DefaultType = switch ($Preferred) { 'push' { '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod' } 'oath' { '#microsoft.graph.softwareOathAuthenticationMethod' } }
+        $DefaultPhone = switch ($Preferred) { 'sms' { 'mobile' } 'voiceMobile' { 'mobile' } 'voiceAlternateMobile' { 'alternateMobile' } 'voiceOffice' { 'office' } }
+        $RemovableMethods = $RemovableMethods | Sort-Object -Stable -Property @{ Expression = {
+                if (($DefaultType -and $_.'@odata.type' -eq $DefaultType) -or ($DefaultPhone -and $_.phoneType -eq $DefaultPhone)) { 3 }
+                elseif ($_.phoneType -eq 'mobile') { 2 }
+                elseif ($_.phoneType) { 1 }
+                else { 0 }
+            }
+        }
+    }
+
     if (($RemovableMethods | Measure-Object).Count -eq 0) {
-        $Results = "No MFA methods found for user $UserPrincipalName"
+        $Results = if ($MethodId) {
+            "No removable MFA method with id $MethodId found for user $UserPrincipalName"
+        } else {
+            "No MFA methods found for user $UserPrincipalName"
+        }
         Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Results -sev 'Info'
         return $Results
     }
@@ -53,11 +97,11 @@ function Remove-CIPPUserMFA {
             $MethodType = ($Method.'@odata.type' -split '\.')[-1] -replace 'Authentication', ''
             switch ($MethodType) {
                 'qrCodePinMethod' {
-                    $Uri = 'https://graph.microsoft.com/beta/users/{0}/authentication/{1}' -f $UserPrincipalName, $MethodType
+                    $Uri = 'https://graph.microsoft.com/beta/users/{0}/authentication/{1}' -f $EncodedUser, $MethodType
                     break
                 }
                 default {
-                    $Uri = 'https://graph.microsoft.com/v1.0/users/{0}/authentication/{1}s/{2}' -f $UserPrincipalName, $MethodType, $Method.id
+                    $Uri = 'https://graph.microsoft.com/v1.0/users/{0}/authentication/{1}s/{2}' -f $EncodedUser, $MethodType, $Method.id
                 }
             }
             try {
@@ -79,7 +123,11 @@ function Remove-CIPPUserMFA {
             throw $Message
         }
 
-        $Message = "Successfully removed MFA methods ($($Succeeded -join ', ')) for user $UserPrincipalName. User must supply MFA at next logon"
+        $Message = if ($MethodId) {
+            "Successfully removed MFA method ($($Succeeded -join ', ')) for user $UserPrincipalName"
+        } else {
+            "Successfully removed MFA methods ($($Succeeded -join ', ')) for user $UserPrincipalName. User must supply MFA at next logon"
+        }
         Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Message -sev 'Info'
         return $Message
     }

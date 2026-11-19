@@ -8,6 +8,10 @@ function Invoke-RemoveIntuneReusableSettingTemplate {
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
 
+    if (-not (Test-CippTemplateWriteAccess)) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::Forbidden; Body = @{ Results = 'Roles limited to specific tenants cannot change or remove shared templates.' } })
+    }
+
     $APIName = $Request.Params.CIPPEndpoint
     $Headers = $Request.Headers
 
@@ -20,7 +24,7 @@ function Invoke-RemoveIntuneReusableSettingTemplate {
         $SafeID = ConvertTo-CIPPODataFilterValue -Value $ID -Type Guid
         $Filter = "PartitionKey eq 'IntuneReusableSettingTemplate' and RowKey eq '$SafeID'"
         $Row = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey
-        Remove-AzDataTableEntity -Force @Table -Entity $Row
+        Remove-CIPPAzDataTableEntity -Force @Table -Entity $Row
 
         $Result = "Removed Intune reusable setting template with ID $ID"
         Write-LogMessage -Headers $Headers -API $APIName -message $Result -Sev 'Info'

@@ -9,9 +9,9 @@ function Set-CIPPCPVConsent {
     $Results = [System.Collections.Generic.List[string]]::new()
     $Tenant = Get-Tenants -IncludeAll | Where-Object -Property customerId -EQ $TenantFilter | Select-Object -First 1
     $TenantName = $Tenant.displayName
-    $User = $Request.Headers
+    $User = $Headers
 
-    if ($TenantFilter -eq $env:TenantID) {
+    if ($TenantFilter -eq $env:TenantID -or $Tenant.isPartnerTenantRow -eq $true -or (Get-CIPPPartnerTenant -PartnerTenantId $TenantFilter)) {
         return @('Cannot modify CPV consent on partner tenant')
     }
     if ($Tenant.customerId -ne $TenantFilter) {
@@ -21,23 +21,16 @@ function Set-CIPPCPVConsent {
         return @('Application is already consented to this tenant')
     }
 
-    # Skip the Partner Center POST if consent was applied recently and we're not resetting
-    if (-not $ResetSP) {
-        $CpvTable = Get-CIPPTable -TableName cpvtenants
-        $ExistingRow = Get-CIPPAzDataTableEntity @CpvTable -Filter "PartitionKey eq 'Tenant' and RowKey eq '$TenantFilter'"
-        if ($ExistingRow -and $ExistingRow.applicationId -eq $env:ApplicationID -and $ExistingRow.LastApply) {
-            $UnixNow = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
-            if (($UnixNow - [int64]$ExistingRow.LastApply) -lt 86400) {
-                return @("CPV consent for $TenantName is current, skipping re-consent")
-            }
-        }
-    }
+    # Partner Center consent calls run as the tenant's owning partner
+    $OwningPartner = Resolve-CIPPOwningPartner -TenantRow $Tenant
 
     if ($ResetSP) {
         try {
             if ($PSCmdlet.ShouldProcess($env:ApplicationID, "Delete Service Principal from $TenantName")) {
-                $null = New-GraphPostRequest -Type DELETE -noauthcheck $true -uri "https://api.partnercenter.microsoft.com/v1/customers/$($TenantFilter)/applicationconsents/$($env:ApplicationID)" -scope 'https://api.partnercenter.microsoft.com/.default' -tenantid $env:TenantID
+                $null = New-GraphPostRequest -Type DELETE -noauthcheck $true -uri "https://api.partnercenter.microsoft.com/v1/customers/$($TenantFilter)/applicationconsents/$($env:ApplicationID)" -scope 'https://api.partnercenter.microsoft.com/.default' -tenantid $OwningPartner
             }
+            # The SP is gone, so any cached token for this tenant is now invalid.
+            $null = Clear-CippTokenCache -TenantFilter $TenantFilter
             $Results.add("Deleted Service Principal from $TenantName")
         } catch {
             $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
@@ -61,7 +54,7 @@ function Set-CIPPCPVConsent {
         } | ConvertTo-Json
 
         if ($PSCmdlet.ShouldProcess($env:ApplicationID, "Add Service Principal to $TenantName")) {
-            $null = New-GraphpostRequest -body $AppBody -Type POST -noauthcheck $true -uri "https://api.partnercenter.microsoft.com/v1/customers/$($TenantFilter)/applicationconsents" -scope 'https://api.partnercenter.microsoft.com/.default' -tenantid $env:TenantID
+            $null = New-GraphpostRequest -body $AppBody -Type POST -noauthcheck $true -uri "https://api.partnercenter.microsoft.com/v1/customers/$($TenantFilter)/applicationconsents" -scope 'https://api.partnercenter.microsoft.com/.default' -tenantid $OwningPartner
             $Table = Get-CIPPTable -TableName cpvtenants
             $unixtime = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
             $GraphRequest = @{
@@ -73,6 +66,9 @@ function Set-CIPPCPVConsent {
             }
             Add-CIPPAzDataTableEntity @Table -Entity $GraphRequest -Force
         }
+        # Consent just changed; drop cached tokens so the next call picks up the new scopes
+        # instead of reusing one issued before this grant.
+        $null = Clear-CippTokenCache -TenantFilter $TenantFilter
         $Results.add("Successfully added CPV Application to tenant $($TenantName)") | Out-Null
         Write-LogMessage -Headers $User -API $APINAME -message "Added our Service Principal to $($TenantName)" -Sev 'Info' -tenant $Tenant.defaultDomainName -tenantId $TenantFilter
     } catch {

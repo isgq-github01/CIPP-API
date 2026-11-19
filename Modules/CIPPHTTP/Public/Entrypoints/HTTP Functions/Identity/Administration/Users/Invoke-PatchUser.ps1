@@ -3,7 +3,7 @@ function Invoke-PatchUser {
     .FUNCTIONALITY
         Entrypoint
     .ROLE
-        Identity.User.ReadWrite
+        Identity.User.ReadWrite,Identity.PrivilegedUser.ReadWrite
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -40,6 +40,23 @@ function Invoke-PatchUser {
             $TotalManagerSuccessCount = 0
             $TotalSponsorSuccessCount = 0
             $AllErrorMessages = [System.Collections.Generic.List[string]]::new()
+
+            # Privileged users are left out of a sensitive change and reported, so the rest of the batch still goes through.
+            $SensitiveProperties = @('userPrincipalName', 'mobilePhone', 'businessPhones', 'otherMails', 'accountEnabled', 'passwordProfile', 'passwordPolicies', 'onPremisesImmutableId')
+            $Refused = @{}
+            foreach ($TenantGroup in $UsersByTenant) {
+                $SensitiveUsers = @($TenantGroup.Group.Where({ $User = $_; $SensitiveProperties.Where({ $null -ne $User.PSObject.Properties[$_] }, 'First').Count -gt 0 }))
+                $Refused[$TenantGroup.Name] = @(Assert-CippPrivilegedUserAccess -TenantFilter $TenantGroup.Name -UserId @($SensitiveUsers.id) -PassThru)
+                foreach ($Id in $Refused[$TenantGroup.Name]) {
+                    [void]$AllErrorMessages.Add("Skipped user $Id in tenant $($TenantGroup.Name): they hold a privileged admin role. Managing privileged users needs the Identity.PrivilegedUser.ReadWrite permission.")
+                }
+            }
+            if ($AllErrorMessages.Count -eq @($Users).Count) {
+                return ([HttpResponseContext]@{
+                        StatusCode = [HttpStatusCode]::Forbidden
+                        Body       = @{'Results' = @($AllErrorMessages) }
+                    })
+            }
             $HasManagerUpdates = @($Users | Where-Object { -not [string]::IsNullOrWhiteSpace($_.manager) }).Count -gt 0
             $HasSponsorUpdates = @($Users | Where-Object { -not [string]::IsNullOrWhiteSpace($_.sponsor) }).Count -gt 0
             $HasRelationshipUpdates = $HasManagerUpdates -or $HasSponsorUpdates
@@ -47,21 +64,57 @@ function Invoke-PatchUser {
             # Process each tenant separately
             foreach ($TenantGroup in $UsersByTenant) {
                 $tenantFilter = $TenantGroup.Name
-                $TenantUsers = $TenantGroup.Group
+                $TenantUsers = @($TenantGroup.Group.Where({ $Refused[$tenantFilter] -notcontains $_.id }))
                 $UsersWithManager = $TenantUsers | Where-Object { -not [string]::IsNullOrWhiteSpace($_.manager) }
                 $ManagerGroups = $UsersWithManager | Group-Object -Property manager
                 $UsersWithSponsor = $TenantUsers | Where-Object { -not [string]::IsNullOrWhiteSpace($_.sponsor) }
                 $SponsorGroups = $UsersWithSponsor | Group-Object -Property sponsor
+
+                # Tenant and custom %variables% are replaced first; any %token% left is filled from each
+                # user's own properties, read in one batch.
+                $PatchBodies = @{}
+                $TenantText = [System.Collections.Generic.Dictionary[string, string]]::new()
+                $TokenReads = [System.Collections.Generic.List[object]]::new()
+                foreach ($User in $TenantUsers) {
+                    # Remove routing and relationship properties from the body since they're not normal PATCH properties.
+                    $PatchBodies[$User.id] = $User | Select-Object -Property * -ExcludeProperty id, tenantFilter, manager, sponsor
+                    $Referenced = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    foreach ($Property in $PatchBodies[$User.id].PSObject.Properties.Where({ $_.Value -is [string] -and $_.Value.Contains('%') })) {
+                        if (-not $TenantText.ContainsKey($Property.Value)) {
+                            $TenantText[$Property.Value] = Get-CIPPTextReplacement -TenantFilter $tenantFilter -Text $Property.Value
+                        }
+                        $Property.Value = $TenantText[$Property.Value]
+                        foreach ($Name in (Resolve-CIPPUserPropertyText -Text $Property.Value)) { [void]$Referenced.Add($Name) }
+                    }
+                    if ($Referenced.Count -gt 0) {
+                        $TokenReads.Add(@{ id = $User.id; method = 'GET'; url = "users/$($User.id)?`$select=$(@($Referenced) -join ',')" })
+                    }
+                }
+                if ($TokenReads.Count -gt 0) {
+                    $ReadResults = @{}
+                    foreach ($Read in @(New-GraphBulkRequest -tenantid $tenantFilter -Requests ($TokenReads.ToArray()))) { $ReadResults[$Read.id] = $Read }
+                    foreach ($Read in $TokenReads) {
+                        $Body = $PatchBodies[$Read.id]
+                        $Source = $ReadResults[$Read.id]
+                        try {
+                            if ($Source.status -ne 200) { throw ($Source.body.error.message ?? "could not read the user (status $($Source.status))") }
+                            foreach ($Property in $Body.PSObject.Properties.Where({ $_.Value -is [string] -and $_.Value.Contains('%') })) {
+                                $Property.Value = Resolve-CIPPUserPropertyText -Text $Property.Value -User $Source.body
+                            }
+                        } catch {
+                            $PatchBodies.Remove($Read.id)
+                            [void]$AllErrorMessages.Add("Failed to patch user $($Read.id) in tenant $($tenantFilter): $($_.Exception.Message)")
+                        }
+                    }
+                }
 
                 # Build bulk requests for this tenant
                 $int = 0
                 $BulkRequests = [System.Collections.Generic.List[object]]::new()
                 $BulkRequestUsers = [System.Collections.Generic.List[object]]::new()
                 foreach ($User in $TenantUsers) {
-                    # Remove routing and relationship properties from the body since they're not normal PATCH properties.
-                    $PatchBody = $User | Select-Object -Property * -ExcludeProperty id, tenantFilter, manager, sponsor
-
-                    if (@($PatchBody.PSObject.Properties).Count -eq 0) {
+                    $PatchBody = $PatchBodies[$User.id]
+                    if (-not $PatchBody -or @($PatchBody.PSObject.Properties).Count -eq 0) {
                         continue
                     }
 
@@ -167,7 +220,7 @@ function Invoke-PatchUser {
             if ($AllErrorMessages.Count -eq 0) {
                 $HttpResponse.Body = @{'Results' = @($SuccessMessage) }
             } else {
-                $HttpResponse.StatusCode = [HttpStatusCode]::BadRequest
+                $HttpResponse.StatusCode = Get-CippBulkStatusCode -Total ($TotalPatchSuccessCount + $TotalManagerSuccessCount + $TotalSponsorSuccessCount + $AllErrorMessages.Count) -Failed $AllErrorMessages.Count
                 $PartialSuccessMessage = if ($HasRelationshipUpdates) { $SuccessMessage } else { "Successfully patched $TotalPatchSuccessCount of $($Users.Count) users" }
                 $Results = [System.Collections.Generic.List[string]]::new()
                 foreach ($ErrorMessage in $AllErrorMessages) {
@@ -179,7 +232,7 @@ function Invoke-PatchUser {
         }
 
     } catch {
-        $HttpResponse.StatusCode = [HttpStatusCode]::InternalServerError
+        $HttpResponse.StatusCode = Get-CippErrorStatusCode -ErrorRecord $_
         $HttpResponse.Body = @{'Results' = @("Failed to patch user(s). Error: $($_.Exception.Message)") }
     }
 

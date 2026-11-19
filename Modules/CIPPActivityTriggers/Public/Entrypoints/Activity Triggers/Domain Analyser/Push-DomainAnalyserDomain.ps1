@@ -31,6 +31,8 @@ function Push-DomainAnalyserDomain {
     Set-DnsResolver -Resolver $Resolver
 
     $Domain = $DomainObject.RowKey
+    # Microsoft hosts the DNS for onmicrosoft.com domains, so DNSSEC and MTA-STS cannot be configured and are not scored
+    $IsMicrosoftDomain = $Domain -like '*.onmicrosoft.com'
 
     try {
         $Tenant = $DomainObject.TenantDetails | ConvertFrom-Json -ErrorAction Stop
@@ -53,6 +55,7 @@ function Push-DomainAnalyserDomain {
         DMARCPresent           = ''
         DMARCFullPolicy        = ''
         DMARCActionPolicy      = ''
+        DMARCSubdomainPolicy   = ''
         DMARCReportingActive   = ''
         DMARCPercentagePass    = ''
         DNSSECPresent          = ''
@@ -63,8 +66,9 @@ function Push-DomainAnalyserDomain {
         EnterpriseEnrollment   = ''
         EnterpriseRegistration = ''
         AutoDiscover           = ''
+        MTASTS                 = ''
         Score                  = ''
-        MaximumScore           = 160
+        MaximumScore           = $IsMicrosoftDomain ? 140 : 160
         ScorePercentage        = ''
         ScoreExplanation       = ''
     }
@@ -78,16 +82,25 @@ function Push-DomainAnalyserDomain {
         DMARCSetReject       = 30
         DMARCReportingActive = 20
         DMARCPercentageGood  = 20
-        DNSSECPresent        = 20
+        DNSSECPresent        = 10
         DKIMActiveAndWorking = 20
+        MTASTSEnforced       = 10
+        MTASTSTesting        = 5
     }
 
     $ScoreDomain = 0
     # Setup Score Explanation
-    $ScoreExplanation = [System.Collections.Generic.List[string]]::new()
+    $ScoreExplanation = [System.Collections.Generic.List[object]]::new()
+    # Points is what the finding costs the score; 0 for checks that are reported but not scored.
+    $Explain = { param($Check, $Finding, $Points = 0) $ScoreExplanation.Add([PSCustomObject]@{ Check = $Check; Finding = $Finding; Points = $Points }) }
 
     #Region MX Check
     $MXRecord = Read-MXRecord -Domain $Domain -ErrorAction Stop
+    # A failed lookup is not an empty MX set: saving it would read as every record removed and flip the MX change alert
+    if ($MXRecord.LookupFailed -and -not [string]::IsNullOrEmpty($DomainObject.DomainAnalyser)) {
+        Write-LogMessage -API 'DomainAnalyser' -tenant $DomainObject.TenantId -message "Kept the previous Domain Analyser result for $Domain because its MX lookup failed: $($MXRecord.ValidationFails -join ' ')" -sev Warning
+        return
+    }
 
     $Result.ExpectedSPFRecord = $MXRecord.ExpectedInclude
     $Result.MXPassTest = $false
@@ -101,7 +114,7 @@ function Push-DomainAnalyserDomain {
         $Result.MXPassTest = $true
         $ScoreDomain += $Scores.MXRecommended
     } else {
-        $ScoreExplanation.Add('MX record did not pass validation') | Out-Null
+        & $Explain 'MX' 'MX record did not pass validation' $Scores.MXRecommended
     }
 
     if ([string]::IsNullOrEmpty($MXRecord.MailProvider)) {
@@ -112,6 +125,7 @@ function Push-DomainAnalyserDomain {
     #EndRegion MX Check
 
     #Region SPF Check
+    $SPFRecord = $null
     try {
         $SPFRecord = Read-SpfRecord -Domain $Domain -ErrorAction Stop
         if ($SPFRecord.RecordCount -gt 0) {
@@ -119,11 +133,11 @@ function Push-DomainAnalyserDomain {
             if ($SPFRecord.RecordCount -eq 1) {
                 $ScoreDomain += $Scores.SPFPresent
             } else {
-                $ScoreExplanation.Add('Multiple SPF records detected') | Out-Null
+                & $Explain 'SPF' 'Multiple SPF records detected' $Scores.SPFPresent
             }
         } else {
             $Result.ActualSPFRecord = 'No SPF Record'
-            $ScoreExplanation.Add('No SPF Record Found') | Out-Null
+            & $Explain 'SPF' 'No SPF Record Found' $Scores.SPFPresent
         }
     } catch {
         $Message = 'SPF Error'
@@ -136,38 +150,47 @@ function Push-DomainAnalyserDomain {
     $SPFFailCount = $SPFRecord.ValidationFails | Measure-Object | Select-Object -ExpandProperty Count
     $Result.SPFPassAll = $false
 
-    if ($SPFFailCount -eq 0) {
+    if ($SPFRecord -and $SPFFailCount -eq 0) {
         $ScoreDomain += $Scores.SPFCorrectAll
         $Result.SPFPassAll = $true
     } else {
-        $ScoreExplanation.Add('SPF record did not pass validation') | Out-Null
+        & $Explain 'SPF' 'SPF record did not pass validation' $Scores.SPFCorrectAll
     }
     #EndRegion SPF Check
 
     #Region DMARC Check
     try {
         $DMARCPolicy = Read-DmarcPolicy -Domain $Domain -ErrorAction Stop
+        $Policy = $DMARCPolicy.Policy
+        $SubdomainPolicy = $DMARCPolicy.SubdomainPolicy
 
         if ([string]::IsNullOrEmpty($DMARCPolicy.Record)) {
             $Result.DMARCPresent = $false
-            $ScoreExplanation.Add('No DMARC Records Found') | Out-Null
+            & $Explain 'DMARC' 'No DMARC Records Found' ($Scores.DMARCPresent + $Scores.DMARCSetReject + $Scores.DMARCReportingActive + $Scores.DMARCPercentageGood)
         } else {
             $Result.DMARCPresent = $true
             $ScoreDomain += $Scores.DMARCPresent
 
             $Result.DMARCFullPolicy = $DMARCPolicy.Record
-            if ($DMARCPolicy.Policy -eq 'reject' -and $DMARCPolicy.SubdomainPolicy -eq 'reject') {
+            $Result.DMARCSubdomainPolicy = [cultureinfo]::InvariantCulture.TextInfo.ToTitleCase("$SubdomainPolicy")
+            if ($Policy -eq 'reject' -and $SubdomainPolicy -eq 'reject') {
                 $Result.DMARCActionPolicy = 'Reject'
                 $ScoreDomain += $Scores.DMARCSetReject
             }
-            if ($DMARCPolicy.Policy -eq 'none') {
-                $Result.DMARCActionPolicy = 'None'
-                $ScoreExplanation.Add('DMARC is not being enforced') | Out-Null
+            # sp covers every subdomain, including unused ones nobody remembers.
+            if ($Policy -ne 'none' -and $SubdomainPolicy -eq 'none') {
+                & $Explain 'DMARC' 'DMARC subdomain policy is none, so any subdomain can be spoofed. Set sp=reject' $(if ($Policy -eq 'reject') { $Scores.DMARCSetReject } else { 0 })
+            } elseif ($Policy -eq 'reject' -and $SubdomainPolicy -eq 'quarantine') {
+                & $Explain 'DMARC' 'DMARC subdomain policy is only quarantine. Set sp=reject' $Scores.DMARCSetReject
             }
-            if ($DMARCPolicy.Policy -eq 'quarantine') {
+            if ($Policy -eq 'none') {
+                $Result.DMARCActionPolicy = 'None'
+                & $Explain 'DMARC' 'DMARC is not being enforced' $Scores.DMARCSetReject
+            }
+            if ($Policy -eq 'quarantine') {
                 $Result.DMARCActionPolicy = 'Quarantine'
                 $ScoreDomain += $Scores.DMARCSetQuarantine
-                $ScoreExplanation.Add('DMARC Partially Enforced with quarantine') | Out-Null
+                & $Explain 'DMARC' 'DMARC Partially Enforced with quarantine' ($Scores.DMARCSetReject - $Scores.DMARCSetQuarantine)
             }
 
             $ReportEmailCount = $DMARCPolicy.ReportingEmails | Measure-Object | Select-Object -ExpandProperty Count
@@ -176,7 +199,7 @@ function Push-DomainAnalyserDomain {
                 $ScoreDomain += $Scores.DMARCReportingActive
             } else {
                 $Result.DMARCReportingActive = $False
-                $ScoreExplanation.Add('DMARC Reporting not Configured') | Out-Null
+                & $Explain 'DMARC' 'DMARC Reporting not Configured' $Scores.DMARCReportingActive
             }
 
             if ($DMARCPolicy.Percent -eq 100) {
@@ -184,7 +207,7 @@ function Push-DomainAnalyserDomain {
                 $ScoreDomain += $Scores.DMARCPercentageGood
             } else {
                 $Result.DMARCPercentagePass = $false
-                $ScoreExplanation.Add('DMARC Not Checking All Messages') | Out-Null
+                & $Explain 'DMARC' 'DMARC Not Checking All Messages' $Scores.DMARCPercentageGood
             }
         }
     } catch {
@@ -201,10 +224,10 @@ function Push-DomainAnalyserDomain {
         $DNSSECWarnCount = $DNSSECResult.ValidationFails | Measure-Object | Select-Object -ExpandProperty Count
         if (($DNSSECFailCount + $DNSSECWarnCount) -eq 0) {
             $Result.DNSSECPresent = $true
-            $ScoreDomain += $Scores.DNSSECPresent
+            if (-not $IsMicrosoftDomain) { $ScoreDomain = $ScoreDomain + $Scores.DNSSECPresent }
         } else {
             $Result.DNSSECPresent = $false
-            $ScoreExplanation.Add('DNSSEC Not Configured or Enabled') | Out-Null
+            if (-not $IsMicrosoftDomain) { & $Explain 'DNSSEC' 'DNSSEC Not Configured or Enabled' $Scores.DNSSECPresent }
         }
     } catch {
         $Message = 'DNSSEC Error'
@@ -226,7 +249,7 @@ function Push-DomainAnalyserDomain {
         if ($Domain -match 'onmicrosoft.com' -and $Domain -notmatch 'mail.onmicrosoft.com') {
             $DKIMSelector1Value = "selector1-$($Domain -replace '\.', '-' )"
             $DKIMSelector2Value = "selector2-$($Domain -replace '\.', '-' )"
-            $DkimParams.Add('Selectors', @("$DKIMSelector1Value", "$DKIMSelector2Value"))
+            $DkimParams.Selectors = @("$DKIMSelector1Value", "$DKIMSelector2Value")
         }
 
         $DkimRecord = Read-DkimRecord @DkimParams -ErrorAction Stop
@@ -240,7 +263,19 @@ function Push-DomainAnalyserDomain {
             $Result.DKIMRecords = $DkimRecord.Records | Select-Object Selector, Record
         } else {
             $Result.DKIMEnabled = $false
-            $ScoreExplanation.Add('DKIM Not Configured') | Out-Null
+            & $Explain 'DKIM' 'DKIM Not Configured' $Scores.DKIMActiveAndWorking
+        }
+
+        # Persist the selectors the analyser just discovered so GetDkimSelectors reads them from the
+        # Domains table instead of returning nothing (mirrors how Invoke-ListDomainHealth/ExecDnsConfig store them).
+        $DiscoveredSelectors = @($DkimRecord.Selectors | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Sort-Object -Unique
+        if ($DiscoveredSelectors.Count -gt 0) {
+            $DkimSelectorsJson = [string]($DiscoveredSelectors | ConvertTo-Json -Compress)
+            if ($DomainObject.PSObject.Properties.Name -notcontains 'DkimSelectors') {
+                $DomainObject | Add-Member -MemberType NoteProperty -Name DkimSelectors -Value $DkimSelectorsJson -Force
+            } else {
+                $DomainObject.DkimSelectors = $DkimSelectorsJson
+            }
         }
     } catch {
         $Message = 'DKIM Exception'
@@ -259,14 +294,14 @@ function Push-DomainAnalyserDomain {
                 $Result.EnterpriseEnrollment = 'Correct'
             } elseif ($EnrollmentCNAME -eq 'enterpriseenrollment.manage.microsoft.com') {
                 $Result.EnterpriseEnrollment = 'Legacy'
-                $ScoreExplanation.Add('Enterprise Enrollment CNAME points to legacy endpoint (enterpriseenrollment.manage.microsoft.com)') | Out-Null
+                & $Explain 'Intune Enrollment' 'Enterprise Enrollment CNAME points to legacy endpoint (enterpriseenrollment.manage.microsoft.com)'
             } else {
                 $Result.EnterpriseEnrollment = "Unexpected: $EnrollmentCNAME"
-                $ScoreExplanation.Add('Enterprise Enrollment CNAME points to unexpected target') | Out-Null
+                & $Explain 'Intune Enrollment' 'Enterprise Enrollment CNAME points to unexpected target'
             }
         } else {
             $Result.EnterpriseEnrollment = 'No CNAME'
-            $ScoreExplanation.Add('No Enterprise Enrollment CNAME record found') | Out-Null
+            & $Explain 'Intune Enrollment' 'No Enterprise Enrollment CNAME record found'
         }
     } catch {
         $Result.EnterpriseEnrollment = 'Error'
@@ -282,11 +317,11 @@ function Push-DomainAnalyserDomain {
                 $Result.EnterpriseRegistration = 'Correct'
             } else {
                 $Result.EnterpriseRegistration = "Unexpected: $RegistrationCNAME"
-                $ScoreExplanation.Add('Enterprise Registration CNAME points to unexpected target') | Out-Null
+                & $Explain 'Intune Enrollment' 'Enterprise Registration CNAME points to unexpected target'
             }
         } else {
             $Result.EnterpriseRegistration = 'No CNAME'
-            $ScoreExplanation.Add('No Enterprise Registration CNAME record found') | Out-Null
+            & $Explain 'Intune Enrollment' 'No Enterprise Registration CNAME record found'
         }
     } catch {
         $Result.EnterpriseRegistration = 'Error'
@@ -303,16 +338,45 @@ function Push-DomainAnalyserDomain {
             $Result.AutoDiscover = 'Correct'
         } elseif ($AutoDiscoverFailCount -eq 0) {
             $Result.AutoDiscover = "$($AutoDiscoverRecord.RecordType): $($AutoDiscoverRecord.Record)"
-            $ScoreExplanation.Add("AutoDiscover $($AutoDiscoverRecord.RecordType) record points to unexpected target") | Out-Null
+            & $Explain 'AutoDiscover' "AutoDiscover $($AutoDiscoverRecord.RecordType) record points to unexpected target"
         } else {
             $Result.AutoDiscover = 'No Record'
-            $ScoreExplanation.Add('No AutoDiscover DNS record found') | Out-Null
+            & $Explain 'AutoDiscover' 'No AutoDiscover DNS record found'
         }
     } catch {
         $Result.AutoDiscover = 'Error'
         Write-LogMessage -API 'DomainAnalyser' -tenant $DomainObject.TenantId -message "AutoDiscover check error for $Domain" -LogData (Get-CippException -Exception $_) -sev Error
     }
     #EndRegion AutoDiscover Check
+
+    #Region MTA-STS Check
+    $MtaStsResult = $null
+    try {
+        if ($IsMicrosoftDomain) {
+            $Result.MTASTS = 'Not applicable'
+        } else {
+            $MtaStsResult = Test-MtaSts -Domain $Domain
+            $Result.MTASTS = if (-not $MtaStsResult.StsRecord.Record -and -not $MtaStsResult.StsPolicy.Mode) {
+                'Not configured'
+            } elseif ($MtaStsResult.StsRecord.IsValid -and $MtaStsResult.StsPolicy.IsValid) {
+                $MtaStsResult.StsPolicy.Mode -eq 'enforce' ? 'Enforced' : 'Testing'
+            } else {
+                'Invalid'
+            }
+            switch ($Result.MTASTS) {
+                'Enforced' { $ScoreDomain = $ScoreDomain + $Scores.MTASTSEnforced }
+                'Testing' {
+                    $ScoreDomain = $ScoreDomain + $Scores.MTASTSTesting
+                    & $Explain 'MTA-STS' 'MTA-STS policy is in testing mode' ($Scores.MTASTSEnforced - $Scores.MTASTSTesting)
+                }
+                default { & $Explain 'MTA-STS' "MTA-STS $($Result.MTASTS.ToLower())" $Scores.MTASTSEnforced }
+            }
+        }
+    } catch {
+        $Result.MTASTS = 'Error'
+        Write-LogMessage -API 'DomainAnalyser' -tenant $DomainObject.TenantId -message "MTA-STS check error for $Domain" -LogData (Get-CippException -Exception $_) -sev Error
+    }
+    #EndRegion MTA-STS Check
 
     #Region MSCNAME DKIM Records
     # Get Microsoft DKIM CNAME selector Records
@@ -374,7 +438,7 @@ function Push-DomainAnalyserDomain {
     # Final Score
     $Result.Score = $ScoreDomain
     $Result.ScorePercentage = [int](($Result.Score / $Result.MaximumScore) * 100)
-    $Result.ScoreExplanation = ($ScoreExplanation) -join ', '
+    $Result.ScoreExplanation = @($ScoreExplanation)
 
     $Json = (ConvertTo-Json -InputObject $Result -Depth 5 -Compress).ToString()
 
@@ -383,6 +447,16 @@ function Push-DomainAnalyserDomain {
     } else {
         $DomainObject.DomainAnalyser = $Json
     }
+
+    # Per-check DNSHealth messages, kept beside the result so the domain report can explain findings without re-querying DNS
+    $Checks = [ordered]@{ MX = $MXRecord; SPF = $SPFRecord; DMARC = $DMARCPolicy; DNSSEC = $DNSSECResult; DKIM = $DkimRecord; MTASTS = $MtaStsResult }
+    $CheckResults = [ordered]@{}
+    foreach ($Name in @($Checks.Keys)) {
+        if ($Checks[$Name]) {
+            $CheckResults[$Name] = @{ Passes = @($Checks[$Name].ValidationPasses); Warns = @($Checks[$Name].ValidationWarns); Fails = @($Checks[$Name].ValidationFails) }
+        }
+    }
+    $DomainObject | Add-Member -NotePropertyName DomainAnalyserChecks -NotePropertyValue ([string](ConvertTo-Json -InputObject $CheckResults -Depth 4 -Compress)) -Force
 
     try {
         $DomainTable.Entity = $DomainObject

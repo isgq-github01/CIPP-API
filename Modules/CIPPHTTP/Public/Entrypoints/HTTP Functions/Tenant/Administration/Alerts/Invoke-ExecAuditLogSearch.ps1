@@ -28,7 +28,7 @@ function Invoke-ExecAuditLogSearch {
                 return
             }
 
-            $Existing = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'Search' and RowKey eq '$SearchId' and Tenant eq '$TenantFilter'"
+            $Existing = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'Search' and RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $SearchId)' and Tenant eq '$(ConvertTo-CIPPODataFilterValue -Value $TenantFilter)'"
             if (!$Existing) {
                 $Search = New-GraphGetRequest -Uri "https://graph.microsoft.com/beta/security/auditLog/queries/$SearchId" -AsApp $true -TenantId $TenantFilter
                 Write-Information ($Search | ConvertTo-Json -Depth 10)
@@ -49,6 +49,11 @@ function Invoke-ExecAuditLogSearch {
             }
 
             Add-CIPPAzDataTableEntity @Table -Entity $Entity -Force | Out-Null
+
+            # Bridge into the V2 AuditLogCoverage ledger so the pipeline picks it up automatically
+            # (re-queuing resets it to State 'Created' to reprocess).
+            $ManualStatus = if ($Search) { [string]$Search.status } else { '' }
+            Add-CippAuditLogCoverageManualEntry -TenantFilter $TenantFilter -SearchId $SearchId -StartTime $Entity.StartTime -EndTime $Entity.EndTime -SearchStatus $ManualStatus
 
             $DisplayName = $Entity.DisplayName
             Write-LogMessage -headers $Headers -API $APIName -message "Queued search for processing: $($Search.displayName)" -Sev 'Info' -tenant $TenantFilter
@@ -141,7 +146,7 @@ function Invoke-ExecAuditLogSearch {
                     })
             } catch {
                 return ([HttpResponseContext]@{
-                        StatusCode = [HttpStatusCode]::BadRequest
+                        StatusCode = [HttpStatusCode]::InternalServerError
                         Body       = $_.Exception.Message
                     })
             }

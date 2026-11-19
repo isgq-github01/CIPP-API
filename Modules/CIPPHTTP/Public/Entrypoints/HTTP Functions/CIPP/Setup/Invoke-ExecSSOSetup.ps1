@@ -14,6 +14,16 @@ function Invoke-ExecSSOSetup {
     $Action = $Request.Body.Action ?? $Request.Query.Action ?? 'Status'
     $MigrationTable = Get-CIPPTable -tablename 'SSOMigration'
 
+    # Restricted multi-tenant mode: other tenant IDs allowed to sign in when multi-tenant (Update only)
+    $AllowedTenants = @(foreach ($Tenant in @($Request.Body.allowedTenants)) {
+            $Value = [string]($Tenant.value ?? $Tenant)
+            if ($Value) { $Value.Trim().ToLower() }
+        })
+    $InvalidTenant = $AllowedTenants.Where({ -not ($_ -as [guid]) }, 'First')
+    if ($InvalidTenant) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::BadRequest; Body = @{ Results = "'$($InvalidTenant[0])' is not a tenant ID" } })
+    }
+
     # Resolve the redirect URI once for any action that needs it
     $ResolveTargetUrl = {
         param($BodyUrl)
@@ -21,6 +31,35 @@ function Invoke-ExecSSOSetup {
         $FromHeader = $Request.Headers.origin ?? $Request.Headers.referer?.TrimEnd('/')
         if ($FromHeader) { return $FromHeader }
         return "https://$($env:WEBSITE_HOSTNAME)"
+    }
+
+    # Compare the callbacks registered on the SSO app against every hostname bound to this
+    # container. A container can have several custom domains and each needs its own callback,
+    # so "missing" here means those domains cannot sign in yet.
+    $GetRedirectUriState = {
+        param([string]$AppId)
+        $HostnameState = Get-CIPPSiteHostname -IncludeStatus
+        $Required = @($HostnameState.RedirectUris)
+        $Registered = @()
+        if ($AppId) {
+            try {
+                $App = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/applications(appId='$AppId')?`$select=web" -NoAuthCheck $true -AsApp $true
+                $Registered = @($App.web.redirectUris)
+            } catch {
+                Write-Information "[SSO-Setup] Could not read redirect URIs for $AppId : $($_.Exception.Message)"
+            }
+        }
+        [PSCustomObject]@{
+            # Fall back to the required set when the app can't be read, so the UI still shows
+            # which URLs this instance expects rather than an empty list.
+            RedirectUris    = if ($Registered.Count -gt 0) { $Registered } else { $Required }
+            MissingUris     = @($Required | Where-Object { $_ -notin $Registered })
+            Known           = $Registered.Count -gt 0
+            # False means the bound-domain list is a best-effort guess, so an empty MissingUris
+            # is NOT proof that every domain can sign in. The UI has to say so.
+            DomainsVerified = $HostnameState.Discovered
+            DomainsError    = $HostnameState.Error
+        }
     }
 
     # Save a row to the migration table while preserving fields that aren't being updated
@@ -72,20 +111,27 @@ function Invoke-ExecSSOSetup {
                         $MigrationError = if ($MigrationMatches) { $Migration.LastError } else { '' }
                         $MigrationCanRepair = $MigrationMatches -and ($Migration.Status -in @('error', 'app_created', 'appid_stored'))
 
+                        # Null (rather than false) when warmup has never attempted the grant, so
+                        # the UI can tell "not yet tried" apart from "tried and refused".
+                        $Preconsented = if ([string]::IsNullOrWhiteSpace($Migration.Preconsented)) { $null } else { $Migration.Preconsented -eq 'true' }
+
                         $Body = @{
                             Results = @{
-                                configured     = $true
-                                status         = $MigrationStatus
-                                appId          = $ClientId
-                                multiTenant    = $IsMultiTenant
-                                tenantId       = $IssuerTenantId
-                                issuer         = $Issuer
-                                audiences      = $AllowedAudiences
-                                allowedApps    = $AllowedApps
-                                excludedPaths  = $ExcludedPaths
-                                easyAuthActive = $true
-                                lastError      = $MigrationError
-                                canRepair      = [bool]$MigrationCanRepair
+                                configured      = $true
+                                status          = $MigrationStatus
+                                appId           = $ClientId
+                                multiTenant     = $IsMultiTenant
+                                allowedTenants  = @(([Environment]::GetEnvironmentVariable('WEBSITE_AUTH_AAD_ALLOWED_TENANTS') ?? '') -split ',' | Where-Object { $_ -and $_ -ne $env:TenantID })
+                                tenantId        = $IssuerTenantId
+                                issuer          = $Issuer
+                                audiences       = $AllowedAudiences
+                                allowedApps     = $AllowedApps
+                                excludedPaths   = $ExcludedPaths
+                                easyAuthActive  = $true
+                                lastError       = $MigrationError
+                                canRepair       = [bool]$MigrationCanRepair
+                                preconsented    = $Preconsented
+                                preconsentError = $Migration.PreconsentError
                             }
                         }
                     } else {
@@ -94,15 +140,17 @@ function Invoke-ExecSSOSetup {
                         if ($Migration) {
                             $Body = @{
                                 Results = @{
-                                    configured     = $true
-                                    status         = $Migration.Status
-                                    appId          = $Migration.AppId
-                                    multiTenant    = [bool]($Migration.MultiTenant -eq 'true' -or $Migration.MultiTenant -eq 'True')
-                                    createdAt      = $Migration.CreatedAt
-                                    lastChecked    = $Migration.LastChecked
-                                    lastError      = $Migration.LastError
-                                    easyAuthActive = $false
-                                    canRepair      = [bool]($Migration.AppId -and ($Migration.Status -in @('error', 'app_created', 'appid_stored')))
+                                    configured      = $true
+                                    status          = $Migration.Status
+                                    appId           = $Migration.AppId
+                                    multiTenant     = [bool]($Migration.MultiTenant -eq 'true' -or $Migration.MultiTenant -eq 'True')
+                                    createdAt       = $Migration.CreatedAt
+                                    lastChecked     = $Migration.LastChecked
+                                    lastError       = $Migration.LastError
+                                    easyAuthActive  = $false
+                                    canRepair       = [bool]($Migration.AppId -and ($Migration.Status -in @('error', 'app_created', 'appid_stored')))
+                                    preconsented    = if ([string]::IsNullOrWhiteSpace($Migration.Preconsented)) { $null } else { $Migration.Preconsented -eq 'true' }
+                                    preconsentError = $Migration.PreconsentError
                                 }
                             }
                         } else {
@@ -121,14 +169,16 @@ function Invoke-ExecSSOSetup {
                     if ($Migration) {
                         $Body = @{
                             Results = @{
-                                configured  = $true
-                                status      = $Migration.Status
-                                appId       = $Migration.AppId
-                                multiTenant = [bool]($Migration.MultiTenant -eq 'true' -or $Migration.MultiTenant -eq 'True')
-                                createdAt   = $Migration.CreatedAt
-                                lastChecked = $Migration.LastChecked
-                                lastError   = $Migration.LastError
-                                canRepair   = [bool]($Migration.AppId -and ($Migration.Status -in @('error', 'app_created', 'appid_stored')))
+                                configured      = $true
+                                status          = $Migration.Status
+                                appId           = $Migration.AppId
+                                multiTenant     = [bool]($Migration.MultiTenant -eq 'true' -or $Migration.MultiTenant -eq 'True')
+                                createdAt       = $Migration.CreatedAt
+                                lastChecked     = $Migration.LastChecked
+                                lastError       = $Migration.LastError
+                                canRepair       = [bool]($Migration.AppId -and ($Migration.Status -in @('error', 'app_created', 'appid_stored')))
+                                preconsented    = if ([string]::IsNullOrWhiteSpace($Migration.Preconsented)) { $null } else { $Migration.Preconsented -eq 'true' }
+                                preconsentError = $Migration.PreconsentError
                             }
                         }
                     } else {
@@ -139,6 +189,87 @@ function Invoke-ExecSSOSetup {
                     Write-LogMessage -API $APIName -message "Failed to get SSO status: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
                     $Body = @{ Results = @{ configured = $false; status = 'error'; lastError = $ErrorMessage.NormalizedError } }
                 }
+            }
+
+            # Report which hostnames can actually sign in, and self-heal a domain that was
+            # bound after the app was provisioned (e.g. a custom domain added from the
+            # management portal). Only patches when something is genuinely missing, so
+            # polling this endpoint doesn't hammer Graph with writes.
+            try {
+                if ($Body.Results -is [hashtable] -and $Body.Results.appId) {
+                    $UriState = & $GetRedirectUriState $Body.Results.appId
+                    if ($UriState.Known -and $UriState.MissingUris.Count -gt 0) {
+                        Write-Information "[SSO-Setup] $($UriState.MissingUris.Count) bound hostname(s) missing a callback — patching"
+                        $Refreshed = Update-CIPPSSORedirectUri -PassThru
+                        if ($Refreshed.Status -eq 'updated') { $UriState = & $GetRedirectUriState $Body.Results.appId }
+                    }
+                    $Body.Results.redirectUris = @($UriState.RedirectUris)
+                    $Body.Results.missingRedirectUris = @($UriState.MissingUris)
+                    $Body.Results.domainsVerified = [bool]$UriState.DomainsVerified
+                    $Body.Results.domainsError = $UriState.DomainsError
+                }
+            } catch {
+                Write-Information "[SSO-Setup] Redirect URI status check failed (non-fatal): $($_.Exception.Message)"
+            }
+
+            # Best-effort: the card shows when the newest SSO secret expires; the token timer rotates it.
+            if ($Body.Results -is [hashtable] -and $Body.Results.appId) {
+                try {
+                    $SSOApp = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/applications(appId='$($Body.Results.appId)')?`$select=passwordCredentials" -AsApp $true -NoAuthCheck $true
+                    $NewestSecret = $SSOApp.passwordCredentials | Sort-Object -Property endDateTime -Descending | Select-Object -First 1
+                    $Body.Results.secretExpires = $NewestSecret.endDateTime
+                    $Body.Results.secretKeyId = $NewestSecret.keyId
+                } catch {
+                    $Body.Results.secretExpires = $null
+                    $Body.Results.secretKeyId = $null
+                }
+            }
+        }
+
+        'RefreshRedirectUris' {
+            # Register a callback for every hostname bound to this container. Warmup does this
+            # too, but a domain added through the management portal would otherwise have no
+            # callback until the next restart - and sign-in on it fails with AADSTS50011.
+            try {
+                $Refreshed = Update-CIPPSSORedirectUri -PassThru
+
+                if ($Refreshed.Status -eq 'skipped') {
+                    $StatusCode = [HttpStatusCode]::BadRequest
+                    $Body = @{ Results = $Refreshed.Message }
+                    break
+                }
+                if ($Refreshed.Status -eq 'error') {
+                    $StatusCode = [HttpStatusCode]::InternalServerError
+                    $Body = @{ Results = "Failed to refresh sign-in URLs: $($Refreshed.Message)" }
+                    break
+                }
+
+                if ($Refreshed.AddedUris.Count -gt 0) {
+                    Write-LogMessage -API $APIName -headers $Headers -message "Refreshed SSO sign-in URLs, added: $($Refreshed.AddedUris -join ', ')" -sev Info
+                }
+
+                # 'partial' means the additive patch ran but we could not read the full list of
+                # domains bound to this container, so we cannot promise every domain can sign in.
+                # Reporting that as a success is how a broken custom domain stays invisible.
+                $IsPartial = $Refreshed.Status -eq 'partial'
+                if ($IsPartial) {
+                    Write-LogMessage -API $APIName -headers $Headers -message "SSO sign-in URL refresh could not enumerate bound domains: $($Refreshed.Message)" -sev Warning
+                }
+
+                $Body = @{
+                    Results = @{
+                        message         = $Refreshed.Message
+                        redirectUris    = @($Refreshed.RedirectUris)
+                        addedUris       = @($Refreshed.AddedUris)
+                        domainsVerified = -not $IsPartial
+                        severity        = if ($IsPartial) { 'warning' } else { 'success' }
+                    }
+                }
+            } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API $APIName -headers $Headers -message "SSO sign-in URL refresh failed: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
+                $StatusCode = [HttpStatusCode]::InternalServerError
+                $Body = @{ Results = "Failed to refresh sign-in URLs: $($ErrorMessage.NormalizedError)" }
             }
         }
 
@@ -193,8 +324,7 @@ function Invoke-ExecSSOSetup {
 
                     # Best-effort: stash TenantID in KV if missing (was previously inline)
                     if (-not ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true' -or $env:NonLocalHostAzurite -eq 'true')) {
-                        $KV = $env:WEBSITE_DEPLOYMENT_ID
-                        $VaultName = if ($KV) { ($KV -split '-')[0] } else { $null }
+                        $VaultName = Get-CippKeyVaultName
                         if ($VaultName -and $env:TenantID) {
                             $ExistingTenantId = $null
                             try { $ExistingTenantId = Get-CippKeyVaultSecret -VaultName $VaultName -Name 'TenantID' -AsPlainText -ErrorAction Stop } catch { }
@@ -248,6 +378,10 @@ function Invoke-ExecSSOSetup {
 
                 # --- Step 6: Mark migration as secrets_stored ---
                 & $SaveMigrationRow @{ Status = 'secrets_stored'; LastError = '' }
+
+                # New credentials are stored - lift a pending management-portal SSO reset
+                # so warmup's auto-configure can use them instead of re-entering setup.
+                Remove-CIPPMigrationAppSetting -SettingName 'CIPP_SSO_RESET'
 
                 Write-LogMessage -API $APIName -headers $Headers -message "SSO migration credentials stored for app $AppId" -sev Info
                 $Body = @{
@@ -344,7 +478,7 @@ function Invoke-ExecSSOSetup {
                 $PreviousAppId = $Existing.AppId
 
                 if ($Existing) {
-                    Remove-AzDataTableEntity @MigrationTable -Entity $Existing -Force | Out-Null
+                    Remove-CIPPAzDataTableEntity @MigrationTable -Entity $Existing -Force | Out-Null
                     Write-LogMessage -API $APIName -headers $Headers -message "SSO migration record cleared (previous AppId: $PreviousAppId). Use Create to provision a new app." -sev Info
                 }
 
@@ -394,15 +528,25 @@ function Invoke-ExecSSOSetup {
                 # Look up the existing app and patch it
                 $AppResponse = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/applications(appId='$($Existing.AppId)')?`$select=id,appId,web,signInAudience" -NoAuthCheck $true -AsApp $true
 
+                # Merge, never replace. $TargetUrl is only whichever domain the admin is
+                # browsing from - an instance can have several custom domains bound, and each
+                # needs its own callback. Replacing the array here used to strip sign-in from
+                # every other domain until the next container restart re-ran warmup.
+                $MergedUris = [System.Collections.Generic.List[string]]::new()
+                foreach ($Uri in @($AppResponse.web.redirectUris)) { $MergedUris.Add($Uri) }
+                foreach ($Uri in @($CallbackUri) + @(Get-CIPPSiteHostname -AsRedirectUri)) {
+                    if ($Uri -notin $MergedUris) { $MergedUris.Add($Uri) }
+                }
+
                 $PatchBody = @{
                     signInAudience = $SignInAudience
                     web            = @{
-                        redirectUris          = @($CallbackUri)
+                        redirectUris          = $MergedUris
                         implicitGrantSettings = @{ enableIdTokenIssuance = $true }
                     }
                 } | ConvertTo-Json -Depth 10 -Compress
 
-                New-GraphPOSTRequest -uri "https://graph.microsoft.com/v1.0/applications/$($AppResponse.id)" -body $PatchBody -type PATCH -NoAuthCheck $true -AsApp $true
+                $null = New-GraphPOSTRequest -uri "https://graph.microsoft.com/v1.0/applications/$($AppResponse.id)" -body $PatchBody -type PATCH -NoAuthCheck $true -AsApp $true
 
                 # Update migration table
                 & $SaveMigrationRow @{
@@ -419,14 +563,17 @@ function Invoke-ExecSSOSetup {
 
                 # Update EasyAuth ARM config on the App Service (issuer URL + allowed tenants)
                 try {
-                    Set-CIPPSSOEasyAuth -AppId $Existing.AppId -MultiTenant $MultiTenant -TenantId $env:TenantID
+                    # A request without allowedTenants keeps the current restriction
+                    $EasyAuthParams = @{ AppId = $Existing.AppId; MultiTenant = $MultiTenant; TenantId = $env:TenantID }
+                    if ($null -ne $Request.Body.allowedTenants) { $EasyAuthParams.AllowedTenants = $AllowedTenants }
+                    Set-CIPPSSOEasyAuth @EasyAuthParams
                 } catch {
                     Write-Information "[SSO-Update] EasyAuth ARM update skipped (may not be in App Service): $($_.Exception.Message)"
                 }
 
                 $Body = @{
                     Results = @{
-                        message     = "SSO app updated successfully. Sign-in audience is now $SignInAudience."
+                        message     = "SSO app updated successfully. Sign-in audience is now $SignInAudience.$(if ($MultiTenant -and $AllowedTenants.Count -gt 0) { " Sign-in is restricted to this tenant and $($AllowedTenants.Count) other tenant(s)." })"
                         appId       = $Existing.AppId
                         multiTenant = $MultiTenant
                         severity    = 'success'
@@ -473,7 +620,9 @@ function Invoke-ExecSSOSetup {
 
                 & $SaveMigrationRow @{ LastError = '' }
 
-                Write-LogMessage -API $APIName -headers $Headers -message "SSO app secret rotated for $($Existing.AppId)" -sev Info
+                $Actor = 'CIPP'
+                try { $Actor = ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Headers.'x-ms-client-principal')) | ConvertFrom-Json).userDetails ?? 'CIPP' } catch { }
+                Write-LogMessage -API $APIName -headers $Headers -tenant 'Global' -message "Manual rotation by $Actor`: new CIPP-SSO client secret created for $($Existing.AppId)" -sev Alert
                 $Body = @{
                     Results = @{
                         message  = 'Client secret rotated successfully. The new secret will be picked up from Key Vault on next restart.'
@@ -482,7 +631,7 @@ function Invoke-ExecSSOSetup {
                 }
             } catch {
                 $ErrorMessage = Get-CippException -Exception $_
-                Write-LogMessage -API $APIName -headers $Headers -message "SSO secret rotation failed: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
+                Write-LogMessage -API $APIName -headers $Headers -tenant 'Global' -message "SSO secret rotation failed: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
                 $StatusCode = [HttpStatusCode]::InternalServerError
                 $Body = @{ Results = "Secret rotation failed: $($ErrorMessage.NormalizedError)" }
             }
@@ -513,8 +662,7 @@ function Invoke-ExecSSOSetup {
                         $DevSecret = Get-CIPPAzDataTableEntity @DevSecretsTable -Filter "PartitionKey eq 'SSO' and RowKey eq 'SSO'" -ErrorAction SilentlyContinue
                         $ExistingAppId = $DevSecret.SSOAppId
                     } else {
-                        $KV = $env:WEBSITE_DEPLOYMENT_ID
-                        $VaultName = if ($KV) { ($KV -split '-')[0] } else { $null }
+                        $VaultName = Get-CippKeyVaultName
                         if ($VaultName) {
                             try { $ExistingAppId = Get-CippKeyVaultSecret -VaultName $VaultName -Name 'SSOAppId' -AsPlainText -ErrorAction Stop } catch { }
                         }
@@ -565,8 +713,9 @@ function Invoke-ExecSSOSetup {
                 # --- Step 5: Configure EasyAuth on the App Service ---
                 Set-CIPPSSOEasyAuth -AppId $AppId -MultiTenant $MultiTenant -TenantId $env:TenantID -UseKvReferences
 
-                # --- Step 6: Remove the migration trigger env var ---
+                # --- Step 6: Remove the migration trigger env var (and any pending SSO reset flag) ---
                 Remove-CIPPMigrationAppSetting -SettingName 'CIPP_SSO_MIGRATION_APPID'
+                Remove-CIPPMigrationAppSetting -SettingName 'CIPP_SSO_RESET'
 
                 # --- Step 7: Mark complete ---
                 & $SaveMigrationRow @{ Status = 'complete'; LastError = '' }
@@ -593,9 +742,82 @@ function Invoke-ExecSSOSetup {
             }
         }
 
+        'ManualConfigure' {
+            # Manually set the SSO AppId / client secret / multi-tenant flag directly in Key Vault.
+            # Used to rotate the secret by hand or repoint EasyAuth at a different app registration
+            # without the automated Create/Repair flow. Credentials are read from KV at startup,
+            # so the instance must be restarted for the change to take effect.
+            try {
+                $AppId = $Request.Body.appId
+                $AppSecret = $Request.Body.appSecret
+                $MultiTenant = [bool]($Request.Body.multiTenant)
+
+                # Validate AppId — must be a GUID
+                $ParsedGuid = [System.Guid]::Empty
+                if ([string]::IsNullOrWhiteSpace($AppId) -or -not [System.Guid]::TryParse($AppId.Trim(), [ref]$ParsedGuid)) {
+                    $StatusCode = [HttpStatusCode]::BadRequest
+                    $Body = @{ Results = 'A valid Application (client) ID is required.' }
+                    break
+                }
+                $AppId = $ParsedGuid.ToString()
+
+                if ([string]::IsNullOrWhiteSpace($AppSecret)) {
+                    $StatusCode = [HttpStatusCode]::BadRequest
+                    $Body = @{ Results = 'A client secret is required.' }
+                    break
+                }
+
+                # Persist to Key Vault (or the DevSecrets table in dev mode)
+                Set-CIPPSSOStoredCredentials -AppId $AppId -AppSecret $AppSecret -MultiTenant $MultiTenant
+
+                # Update the migration table so the Status page reflects the manual config.
+                # Clear ObjectId — it belonged to the previous app registration and would be stale
+                # if the AppId was changed. Repair/RotateSecret re-fetch it by AppId when missing.
+                $Existing = Get-CIPPAzDataTableEntity @MigrationTable -Filter "PartitionKey eq 'SSO' and RowKey eq 'MigrationConfig'" -ErrorAction SilentlyContinue
+                & $SaveMigrationRow @{
+                    AppId        = $AppId
+                    ObjectId     = ''
+                    MultiTenant  = [string]$MultiTenant
+                    Status       = 'secrets_stored'
+                    CreatedAt    = $Existing.CreatedAt ?? (Get-Date).ToUniversalTime().ToString('o')
+                    ManualConfig = 'true'
+                    LastError    = ''
+                }
+
+                # New credentials are stored - lift a pending management-portal SSO reset
+                # so warmup's auto-configure can use them instead of re-entering setup.
+                Remove-CIPPMigrationAppSetting -SettingName 'CIPP_SSO_RESET'
+
+                Write-LogMessage -API $APIName -headers $Headers -message "SSO credentials manually configured for app $AppId (multiTenant=$MultiTenant)" -sev Info
+
+                $IsCippNg = [bool]$env:CIPPNG
+                $Message = if ($IsCippNg) {
+                    'SSO credentials saved to Key Vault. Restart the instance to apply the new configuration.'
+                } else {
+                    'SSO credentials saved to Key Vault successfully.'
+                }
+
+                $Body = @{
+                    Results = @{
+                        message         = $Message
+                        appId           = $AppId
+                        multiTenant     = $MultiTenant
+                        requiresRestart = $IsCippNg
+                        isCippNg        = $IsCippNg
+                        severity        = 'success'
+                    }
+                }
+            } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API $APIName -headers $Headers -message "Manual SSO configuration failed: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
+                $StatusCode = [HttpStatusCode]::InternalServerError
+                $Body = @{ Results = "Manual SSO configuration failed: $($ErrorMessage.NormalizedError)" }
+            }
+        }
+
         default {
             $StatusCode = [HttpStatusCode]::BadRequest
-            $Body = @{ Results = "Unknown action: $Action. Use 'Status', 'Create', 'Repair', 'Recreate', 'Update', 'RotateSecret', or 'Migrate'." }
+            $Body = @{ Results = "Unknown action: $Action. Use 'Status', 'Create', 'Repair', 'Recreate', 'Update', 'RefreshRedirectUris', 'RotateSecret', 'ManualConfigure', or 'Migrate'." }
         }
     }
 

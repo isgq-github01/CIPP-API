@@ -8,6 +8,10 @@ Function Invoke-RemoveGroupTemplate {
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
 
+    if (-not (Test-CippTemplateWriteAccess)) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::Forbidden; Body = @{ Results = 'Roles limited to specific tenants cannot change or remove shared templates.' } })
+    }
+
     $APIName = $Request.Params.CIPPEndpoint
     $Headers = $Request.Headers
 
@@ -21,7 +25,7 @@ Function Invoke-RemoveGroupTemplate {
         $Filter = "PartitionKey eq 'GroupTemplate' and RowKey eq '$SafeID'"
         Write-Host $Filter
         $ClearRow = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey
-        Remove-AzDataTableEntity -Force @Table -Entity $ClearRow
+        Remove-CIPPAzDataTableEntity -Force @Table -Entity $ClearRow
         $Result = "Removed Group Template with ID $ID"
         Write-LogMessage -Headers $Headers -API $APIName -message $Result -Sev 'Info'
         $StatusCode = [HttpStatusCode]::OK

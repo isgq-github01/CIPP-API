@@ -1,12 +1,23 @@
 function Invoke-CippPartnerWebhookProcessing {
     [CmdletBinding()]
     param (
-        $Data
+        $Data,
+        [string]$PartnerTenantId
     )
+
+    if (!$PartnerTenantId) { $PartnerTenantId = $env:TenantID }
 
     try {
         if ($Data.AuditUri) {
-            $AuditLog = New-GraphGetRequest -uri $Data.AuditUri -tenantid $env:TenantID -NoAuthCheck $true -scope 'https://api.partnercenter.microsoft.com/.default'
+            $ParsedAuditUri = $null
+            if ([System.Uri]::TryCreate([string]$Data.AuditUri, [System.UriKind]::Absolute, [ref]$ParsedAuditUri) -and
+                $ParsedAuditUri.Scheme -eq 'https' -and
+                $ParsedAuditUri.Host -eq 'api.partnercenter.microsoft.com') {
+                $AuditLog = New-GraphGetRequest -uri $ParsedAuditUri.AbsoluteUri -tenantid $PartnerTenantId -NoAuthCheck $true -scope 'https://api.partnercenter.microsoft.com/.default'
+            } else {
+                Write-LogMessage -API 'Webhooks' -message "Partner Center webhook rejected: AuditUri is not a Partner Center API URL ($($Data.AuditUri))" -Sev 'Alert'
+                return
+            }
         }
 
         switch ($Data.EventName) {
@@ -57,11 +68,12 @@ function Invoke-CippPartnerWebhookProcessing {
                             Exception       = ''
                         }
 
-                        $OnboardItem = @{ Id = $Id }
+                        $OnboardItem = @{ Id = $Id; partnerTenantId = $PartnerTenantId }
 
-                        # Check for partner webhook onboarding settings
+                        # Check for partner webhook onboarding settings (per-partner config row)
+                        $ConfigRowKey = if ($PartnerTenantId -eq $env:TenantID) { 'PartnerWebhookOnboarding' } else { "PartnerWebhookOnboarding-$PartnerTenantId" }
                         $ConfigTable = Get-CIPPTable -TableName Config
-                        $WebhookConfig = Get-CIPPAzDataTableEntity @ConfigTable -Filter "RowKey eq 'PartnerWebhookOnboarding'"
+                        $WebhookConfig = Get-CIPPAzDataTableEntity @ConfigTable -Filter "RowKey eq '$ConfigRowKey'"
 
                         # Only proceed if automated onboarding is enabled
                         if ($WebhookConfig.Enabled -eq $true) {

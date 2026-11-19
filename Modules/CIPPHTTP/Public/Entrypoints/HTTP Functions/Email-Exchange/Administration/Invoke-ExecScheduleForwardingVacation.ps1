@@ -16,6 +16,7 @@ function Invoke-ExecScheduleForwardingVacation {
         $Users = @($Request.Body.Users)
         $ForwardOption = $Request.Body.forwardOption
         $ForwardInternal = $Request.Body.ForwardInternal.value ?? $Request.Body.ForwardInternal
+        $ForwardInternalDisplayName = [string]$Request.Body.ForwardInternal.label
         $ForwardExternal = $Request.Body.ForwardExternal
         $KeepCopy = if (-not [string]::IsNullOrWhiteSpace($Request.Body.KeepCopy)) { [System.Convert]::ToBoolean($Request.Body.KeepCopy) } else { $false }
         $StartDate = $Request.Body.startDate
@@ -45,6 +46,10 @@ function Invoke-ExecScheduleForwardingVacation {
                 }
                 $SharedParams | Add-Member -NotePropertyName 'ForwardInternal' -NotePropertyValue $ForwardInternal -Force
                 $TargetValue = $ForwardInternal
+                if (-not [string]::IsNullOrWhiteSpace($ForwardInternalDisplayName)) {
+                    $SharedParams | Add-Member -NotePropertyName 'ForwardInternalDisplayName' -NotePropertyValue $ForwardInternalDisplayName -Force
+                    $TargetValue = "$ForwardInternalDisplayName ($ForwardInternal)"
+                }
             }
             'ExternalAddress' {
                 if ([string]::IsNullOrWhiteSpace($ForwardExternal)) {
@@ -84,6 +89,7 @@ function Invoke-ExecScheduleForwardingVacation {
             }) -hidden $false
 
         $Result = "Successfully scheduled forwarding vacation mode for $UserDisplay."
+        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Result -Sev 'Info'
         $StatusCode = [HttpStatusCode]::OK
     } catch {
         $ErrorMessage = Get-CippException -Exception $_

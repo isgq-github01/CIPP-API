@@ -34,11 +34,10 @@ function Get-CIPPAlertDefenderIncidents {
                 IncidentID     = $Incident.id
                 IncidentUrl    = $Incident.incidentWebUrl
                 Tenant         = $TenantFilter
+                Id             = "$($Incident.id)-$($Incident.severity)"
             }
         }
-        if ($AlertData) {
-            Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
-        }
+        Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
 
     } catch {
         # Pretty sure this one is gonna be spammy cause of licensing issues, so it's commented out -Bobby

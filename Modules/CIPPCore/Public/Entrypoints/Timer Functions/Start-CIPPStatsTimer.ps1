@@ -13,7 +13,10 @@ function Start-CIPPStatsTimer {
         if ($env:ApplicationID -ne 'LongApplicationID') {
             $SetupComplete = $true
         }
-        $TenantCount = (Get-Tenants -IncludeAll).count
+        $AllTenants = @(Get-Tenants -IncludeAll)
+        $TenantCount = $AllTenants.Count
+        $DirectAddTenants = @($AllTenants | Where-Object { $_.delegatedPrivilegeStatus -eq 'directTenant' }).Count
+        $GDAPTenants = $TenantCount - $DirectAddTenants
 
 
         $APIVersion = if ($env:CIPPNG -eq 'true') {
@@ -21,32 +24,75 @@ function Start-CIPPStatsTimer {
         } else {
             Get-Content (Join-Path $env:CIPPRootPath 'version_latest.txt') | Out-String
         }
-        $Table = Get-CIPPTable -TableName Extensionsconfig
         try {
+            $Table = Get-CIPPTable -TableName Extensionsconfig
             $RawExt = (Get-CIPPAzDataTableEntity @Table).config | ConvertFrom-Json -Depth 10 -ErrorAction Stop
         } catch {
             $RawExt = @{}
         }
 
-        $ConfigTable = Get-CIPPTable -tablename 'Config'
-        $FunctionOffloading = (Get-CIPPAzDataTableEntity @ConfigTable -Filter "RowKey eq 'OffloadFunctions' and PartitionKey eq 'OffloadFunctions'").state
+        $FunctionOffloading = try {
+            $ConfigTable = Get-CIPPTable -tablename 'Config'
+            (Get-CIPPAzDataTableEntity @ConfigTable -Filter "RowKey eq 'OffloadFunctions' and PartitionKey eq 'OffloadFunctions'").state
+        } catch { $null }
         $OffloadingEnabled = $false
         [bool]::TryParse($FunctionOffloading, [ref]$OffloadingEnabled) | Out-Null
         $CIPPNG = $env:CIPPNG -eq 'true'
 
-        # Get counts of various entities across all tenants
-        $counts = Get-CIPPDbItem -TenantFilter AllTenants -CountsOnly
+        # Get counts of various entities across all tenants: one key read per tenant per type, since a count read without a type scans the whole table
+        $IntunePolicyTypes = @(@(Get-CIPPIntunePolicyListDefinitions).CacheType) + @('IntuneAppProtectionManagedAppPolicies') |
+            Where-Object { $_ -match 'Intune' -and $_ -match 'Policies|Policy' } | Sort-Object -Unique
+        $counts = foreach ($Type in @('Users', 'Devices', 'Groups', 'ManagedDevices', 'IntuneApplications', 'ConditionalAccessPolicies') + $IntunePolicyTypes) {
+            Get-CIPPDbItem -TenantFilter AllTenants -CountsOnly -Type $Type
+        }
         $userCount = ($counts | Where-Object { $_.RowKey -eq 'Users-Count' } | Measure-Object -Property DataCount -Sum).Sum
         $deviceCount = ($counts | Where-Object { $_.RowKey -eq 'Devices-Count' } | Measure-Object -Property DataCount -Sum).Sum
         $groupsCount = ($counts | Where-Object { $_.RowKey -eq 'Groups-Count' } | Measure-Object -Property DataCount -Sum).Sum
         $managedDevicesCount = ($counts | Where-Object { $_.RowKey -eq 'ManagedDevices-Count' } | Measure-Object -Property DataCount -Sum).Sum
         $policyCount = ($counts | Where-Object { $_.RowKey -match 'Intune' -and $_.RowKey -match 'Policies|Policy' } | Measure-Object -Property DataCount -Sum).Sum
         $deployedApps = ($counts | Where-Object { $_.RowKey -eq 'IntuneApplications-Count' } | Measure-Object -Property DataCount -Sum).Sum
-        $ReportsTable = Get-CippTable -tablename 'ReportBuilderTemplates'
-        $CustomReportCount = (Get-CIPPAzDataTableEntity @ReportsTable -Filter "PartitionKey eq 'ReportBuilderTemplates'").count
-        $uniqueStandardsApplied = Get-CIPPStatsUniqueStandardsApplied
-        $driftStandardsCount = Get-CIPPStatsDriftStandardsCount
+        $caPolicyCounts = @($counts | Where-Object { $_.RowKey -eq 'ConditionalAccessPolicies-Count' })
+        $caPolicyCount = ($caPolicyCounts | Measure-Object -Property DataCount -Sum).Sum
+        $CustomReportCount = try {
+            $ReportsTable = Get-CippTable -tablename 'ReportBuilderTemplates'
+            (Get-CIPPAzDataTableEntity @ReportsTable -Filter "PartitionKey eq 'ReportBuilderTemplates'" -Property RowKey).count
+        } catch { $null }
+        $Standards = @(try { Get-CIPPStandards -TenantFilter allTenants } catch { })
+        $uniqueStandardsApplied = Get-CIPPStatsUniqueStandardsApplied -Standards $Standards
+        $driftStandardsCount = Get-CIPPStatsDriftStandardsCount -Standards $Standards
         $mobileEnrollment = Get-CIPPStatsMobileEnrollment
+        $baselineStats = Get-CIPPStatsBaselines
+        $licenseTotals = Get-CIPPStatsLicenseTotals
+        $enterpriseApps = Get-CIPPStatsEnterpriseApps
+        $tenantSecurity = Get-CIPPStatsTenantSecurity -Tenants $AllTenants -CACounts $caPolicyCounts
+        $autopilotModels = @(Get-CIPPStatsAutopilotModels)
+
+        # Feature flags
+        $FeatureFlags = @{}
+        Get-CIPPFeatureFlag | Select-Object -Property Id, Enabled | ForEach-Object {
+            $FeatureFlags[$_.Id] = $_.Enabled
+        }
+
+        # SSO migration status
+        $MigrationConfig = try {
+            $MigrationTable = Get-CIPPTable -tablename 'SSOMigration'
+            Get-CIPPAzDataTableEntity @MigrationTable -Filter "PartitionKey eq 'SSO' and RowKey eq 'MigrationConfig'" -ErrorAction SilentlyContinue
+        } catch { $null }
+        $MigrationStatus = $MigrationConfig.Status
+        # SSO provisioned outside the setup wizard (ARM-level during NG migration) never writes a
+        # migration row. Live EasyAuth is authoritative: when it's active and the row is missing or
+        # points at a different app, report complete — same rule as Invoke-ExecSSOSetup's Status action.
+        if ($CIPPNG -and $env:WEBSITE_AUTH_ENABLED -eq 'True' -and $env:WEBSITE_AUTH_V2_CONFIG_JSON) {
+            try {
+                $LiveConfig = $env:WEBSITE_AUTH_V2_CONFIG_JSON | ConvertFrom-Json -ErrorAction Stop
+                $LiveAppId = $LiveConfig.identityProviders.azureActiveDirectory.registration.clientId
+                if ($LiveAppId -and $MigrationConfig.AppId -ne $LiveAppId) {
+                    $MigrationStatus = 'complete'
+                }
+            } catch {
+                Write-Information "Could not parse EasyAuth config for SSO stats: $($_.Exception.Message)"
+            }
+        }
 
         $SendingObject = [PSCustomObject]@{
             rgid                   = $env:WEBSITE_SITE_NAME
@@ -73,18 +119,30 @@ function Start-CIPPStatsTimer {
             Gradient               = $RawExt.Gradient.Enabled
             NinjaOne               = $RawExt.NinjaOne.Enabled
             haloPSA                = $RawExt.haloPSA.Enabled
+            Syncro                 = $RawExt.Syncro.Enabled
             HIBP                   = $RawExt.HIBP.Enabled
             PWPush                 = $RawExt.PWPush.Enabled
             CFZTNA                 = $RawExt.CFZTNA.Enabled
             GitHub                 = $RawExt.GitHub.Enabled
+            SuperAdminNG           = $FeatureFlags.SuperAdminNG
+            MCPServer              = $FeatureFlags.MCPServer
+            SSOMigrationStatus     = $MigrationStatus
+            FeatureFlags           = ($FeatureFlags | ConvertTo-Json -Compress)
+            BaselineCount          = $baselineStats.BaselineCount
+            BaselineTenantCount    = $baselineStats.BaselineTenantCount
+            BaselineStandardsCount = $baselineStats.BaselineStandardsCount
+            Licenses               = ($licenseTotals | ConvertTo-Json -Compress -Depth 5)
+            EnterpriseApps         = ($enterpriseApps | ConvertTo-Json -Compress -Depth 5 -AsArray)
+            AutopilotModels        = (ConvertTo-Json -InputObject $autopilotModels -Compress)
+            TenantCapabilities     = ($tenantSecurity.TenantCapabilities | ConvertTo-Json -Compress -Depth 5)
+            CAPolicies             = $caPolicyCount
+            SecuritySettings       = ($tenantSecurity.SecuritySettings | ConvertTo-Json -Compress -Depth 5)
+            GDAPTenants            = $GDAPTenants
+            DirectAddTenants       = $DirectAddTenants
         } | ConvertTo-Json
 
-        try {
-            Invoke-CIPPRestMethod -Uri 'https://management.cipp.app/api/stats' -Method POST -Body $SendingObject -ContentType 'application/json'
-        } catch {
-            $rand = Get-Random -Minimum 0.5 -Maximum 5.5
-            Start-Sleep -Seconds $rand
-            Invoke-CIPPRestMethod -Uri 'https://management.cipp.app/api/stats' -Method POST -Body $SendingObject -ContentType 'application/json'
-        }
+        # Every instance fires this timer on the same cron, so the post is staggered by a random 1-5 minutes
+        # and retried (up to 3 attempts) to keep the whole fleet from hitting the stats host in the same moment.
+        $null = Send-CIPPStats -Body $SendingObject
     }
 }

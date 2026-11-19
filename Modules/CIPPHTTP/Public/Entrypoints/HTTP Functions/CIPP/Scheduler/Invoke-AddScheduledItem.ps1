@@ -7,11 +7,6 @@ function Invoke-AddScheduledItem {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-    if ($null -eq $Request.Query.hidden) {
-        $hidden = $false
-    } else {
-        $hidden = $true
-    }
 
     $DisallowDuplicateName = $Request.Query.DisallowDuplicateName ?? $Request.Body.DisallowDuplicateName
 
@@ -21,18 +16,27 @@ function Invoke-AddScheduledItem {
     $Table = Get-CIPPTable -TableName 'ScheduledTasks'
 
     if ($Request.Body.RowKey) {
-        $Filter = "PartitionKey eq 'ScheduledTask' and RowKey eq '$($Request.Body.RowKey)'"
+        $Filter = "PartitionKey eq 'ScheduledTask' and RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $Request.Body.RowKey)'"
         $ExistingTask = (Get-CIPPAzDataTableEntity @Table -Filter $Filter)
+        if ($ExistingTask -and -not (Test-CippTenantInScope -Tenant $ExistingTask.Tenant)) {
+            return ([HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::Forbidden
+                    Body       = @{ Results = 'Access to this scheduled task is not allowed' }
+                })
+        }
+    }
+
+    if ($null -eq $Request.Query.hidden) {
+        if ($ExistingTask -and $null -ne $ExistingTask.Hidden) {
+            $hidden = [bool]$ExistingTask.Hidden
+        } else {
+            $hidden = $false
+        }
+    } else {
+        $hidden = $true
     }
 
     if ($ExistingTask -and $Request.Body.RunNow -eq $true) {
-        $RerunParams = @{
-            TenantFilter = $ExistingTask.Tenant
-            Type         = 'ScheduledTask'
-            API          = $Request.Body.RowKey
-            Clear        = $true
-        }
-        $null = Test-CIPPRerun @RerunParams
         # Clear ExecutedTime so the one-time task rerun guard in Push-ExecScheduledCommand does not block re-execution
         $null = Update-AzDataTableEntity -Force @Table -Entity @{
             PartitionKey = $ExistingTask.PartitionKey

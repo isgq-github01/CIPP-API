@@ -1,0 +1,74 @@
+function Get-CIPPStatsEnterpriseApps {
+    <#
+    .SYNOPSIS
+    Non-Microsoft enterprise apps and the number of tenants each is found in, for the anonymous stats payload
+
+    .DESCRIPTION
+    Reads the cached ServicePrincipals rows for every tenant and keeps the Application-type principals
+    (no managed identities, legacy or social identity provider principals) whose owner is not a Microsoft
+    tenant in the vendor list (Get-CIPPVendorTenantMap) or the tenant the app was found in, and that are
+    not CIPP's own app. Apps are keyed
+    on appId, which is the same object across tenants, and the count is the number of distinct tenants
+    that have it. Each app also carries the tenant ID of the publisher that owns it.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $VendorTenants = Get-CIPPVendorTenantMap
+        $CippAppId = [string]$env:ApplicationID
+        $Fields = [string[]]@('appId', 'displayName', 'appOwnerOrganizationId', 'servicePrincipalType')
+        # Through MethodInfo.Invoke: PowerShell copies a large string passed straight to a method several times per call
+        $ParseJson = [CIPP.CippJson].GetMethod('ConvertFromJson', [type[]]@([string], [string[]]))
+
+        $Apps = @{}
+        # One tenant at a time: service principal rows are large, and holding every tenant's peaks the heap.
+        # Ordinal order, as a table read returns them: an app's display name is the first one seen.
+        $TenantIds = @{}
+        foreach ($TenantRow in (Get-Tenants -IncludeErrors)) {
+            if ($TenantRow.defaultDomainName) { $TenantIds[[string]$TenantRow.defaultDomainName] = [string]$TenantRow.customerId }
+        }
+        $Tenants = [string[]]@($TenantIds.Keys)
+        [Array]::Sort($Tenants, [StringComparer]::Ordinal)
+        foreach ($Tenant in $Tenants) {
+            $TenantId = $TenantIds[$Tenant]
+            foreach ($Row in (Get-CIPPDbItem -Partition $Tenant -Type 'ServicePrincipals')) {
+                if (-not $Row.Data) { continue }
+                $Parsed = try { $ParseJson.Invoke($null, [object[]]@([string]$Row.Data, $Fields)) } catch { $null }
+                foreach ($Sp in @($Parsed)) {
+                    $AppId = [string]$Sp.appId
+                    if ([string]::IsNullOrWhiteSpace($AppId)) { continue }
+                    if ($Sp.servicePrincipalType -ne 'Application') { continue }
+                    if ($CippAppId -and $AppId -eq $CippAppId) { continue }
+                    # Apps the tenant registered itself carry customer-chosen names; only apps owned elsewhere are reported
+                    if ($TenantId -and [string]$Sp.appOwnerOrganizationId -eq $TenantId) { continue }
+                    $Vendor = $null
+                    if ($Sp.appOwnerOrganizationId -and $VendorTenants.TryGetValue([string]$Sp.appOwnerOrganizationId, [ref]$Vendor) -and $Vendor.VendorType -eq 'Microsoft') { continue }
+
+                    if (-not $Apps.ContainsKey($AppId)) {
+                        $Apps[$AppId] = @{
+                            DisplayName      = [string]$Sp.displayName
+                            AppOwnerTenantId = [string]$Sp.appOwnerOrganizationId
+                            Tenants     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                        }
+                    }
+                    [void]$Apps[$AppId].Tenants.Add([string]$Tenant)
+                }
+            }
+        }
+
+        $Results = [System.Collections.Generic.List[object]]::new()
+        foreach ($AppId in $Apps.Keys) {
+            $Results.Add([PSCustomObject]@{
+                    ID               = $AppId
+                    DisplayName      = $Apps[$AppId].DisplayName
+                    AppOwnerTenantId = $Apps[$AppId].AppOwnerTenantId
+                    Count            = $Apps[$AppId].Tenants.Count
+                })
+        }
+        return @($Results | Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, 'DisplayName')
+    } catch {
+        Write-LogMessage -API 'CIPPStatsTimer' -tenant $env:TenantID -message "Failed to calculate enterprise app stats: $($_.Exception.Message)" -sev Warning
+        return @()
+    }
+}

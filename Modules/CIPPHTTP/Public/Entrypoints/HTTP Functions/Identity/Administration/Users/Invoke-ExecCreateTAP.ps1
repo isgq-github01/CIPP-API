@@ -3,7 +3,7 @@ Function Invoke-ExecCreateTAP {
     .FUNCTIONALITY
         Entrypoint
     .ROLE
-        Identity.User.ReadWrite
+        Identity.User.ReadWrite,Identity.PrivilegedUser.ReadWrite
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -16,19 +16,26 @@ Function Invoke-ExecCreateTAP {
     $TenantFilter = $Request.Query.tenantFilter ?? $Request.Body.tenantFilter
     $UserID = $Request.Query.ID ?? $Request.Body.ID
     $LifetimeInMinutes = $Request.Query.lifetimeInMinutes ?? $Request.Body.lifetimeInMinutes
-    $IsUsableOnce = $Request.Query.isUsableOnce ?? $Request.Body.isUsableOnce
+    # Restrict the pass to a single use. New-CIPPTAP takes a [bool], and casting the
+    # string 'false' yields $true, so this must be normalised before it is forwarded.
+    $IsUsableOnce = ($Request.Query.isUsableOnce -eq $true) -or ($Request.Body.isUsableOnce -eq $true)
     $StartDateTime = $Request.Query.startDateTime ?? $Request.Body.startDateTime
+    # Opt-in: most TAPs are used directly by the admin, so the pass is returned in plain text
+    # unless the caller asks for a PwPush link. Same string-to-bool normalisation as above.
+    $GeneratePwPushLink = ($Request.Query.generatePwPushLink -eq $true) -or ($Request.Body.generatePwPushLink -eq $true)
 
     try {
+        Assert-CippPrivilegedUserAccess -TenantFilter $TenantFilter -UserId $UserID
         # Create parameter hashtable for splatting
         $TAPParams = @{
-            UserID            = $UserID
-            TenantFilter      = $TenantFilter
-            APIName           = $APIName
-            Headers           = $Headers
-            LifetimeInMinutes = $LifetimeInMinutes
-            IsUsableOnce      = $IsUsableOnce
-            StartDateTime     = $StartDateTime
+            UserID             = $UserID
+            TenantFilter       = $TenantFilter
+            APIName            = $APIName
+            Headers            = $Headers
+            LifetimeInMinutes  = $LifetimeInMinutes
+            IsUsableOnce       = $IsUsableOnce
+            StartDateTime      = $StartDateTime
+            GeneratePwPushLink = $GeneratePwPushLink
         }
 
         $TAPResult = New-CIPPTAP @TAPParams
@@ -46,7 +53,7 @@ Function Invoke-ExecCreateTAP {
         $StatusCode = [HttpStatusCode]::OK
     } catch {
         $Results = $_.Exception.Message
-        $StatusCode = [HttpStatusCode]::InternalServerError
+        $StatusCode = Get-CippErrorStatusCode -ErrorRecord $_
     }
 
     return ([HttpResponseContext]@{

@@ -1,0 +1,793 @@
+# Pester tests for Invoke-ExecCippReplacemap.
+#
+# Custom variables carry an optional declared type. It is validated on save rather than at
+# deployment, because a mistyped value silently falls back to being substituted as a string - in a
+# template that might not deploy for days. The type is optional so that every variable saved before
+# it existed, and any caller that omits it, keeps the original string behaviour.
+
+BeforeAll {
+    $RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
+    $FunctionPath = Get-ChildItem -Path (Join-Path $RepoRoot 'Modules') -Recurse -Filter 'Invoke-ExecCippReplacemap.ps1' -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $FunctionPath) { throw 'Could not locate Invoke-ExecCippReplacemap.ps1 under Modules/' }
+
+    class HttpResponseContext {
+        [int]$StatusCode
+        [object]$Body
+    }
+
+    # The function uses the short [HttpStatusCode]; the Functions host supplies `using namespace
+    # System.Net`. Register the accelerator so it resolves when dot-sourced here.
+    $TypeAccelerators = [PowerShell].Assembly.GetType('System.Management.Automation.TypeAccelerators')
+    if (-not ([System.Management.Automation.PSTypeName]'HttpStatusCode').Type) {
+        $TypeAccelerators::Add('HttpStatusCode', [System.Net.HttpStatusCode])
+    }
+
+    function Get-CIPPTable { param($tablename) @{} }
+    function Get-CIPPAzDataTableEntity {
+        [CmdletBinding()]
+        param($Filter)
+        if ($null -eq $Filter) { return $script:AllRows }
+        if ($script:RowsByFilter -and $script:RowsByFilter.ContainsKey($Filter)) {
+            return $script:RowsByFilter[$Filter]
+        }
+        return $script:ExistingEntity
+    }
+    function Add-CIPPAzDataTableEntity { param($Entity, [switch]$Force) $script:SavedEntity = $Entity }
+    function Remove-CIPPAzDataTableEntity { param($Entity, [switch]$Force) $script:RemovedEntity = $Entity }
+    function Get-Tenants { param($TenantFilter, [switch]$IncludeErrors) }
+    function Get-CIPPTenantGroupVariables { param($CustomerId) if ($script:GroupVariables) { $script:GroupVariables } else { @{} } }
+    $script:AllowedGroups = @('AllGroups')
+    function Test-CippAccess { param($Request, [switch]$GroupList) , @($script:AllowedGroups) }
+    function Write-LogMessage { param($headers, $API, $tenant, $message, $Sev, $LogData) }
+    $script:CallerPermissions = @('Tenant.Config.ReadWrite', 'Tenant.GlobalVariables.ReadWrite')
+    function Get-CippRequestAllowedPermissions { , @($script:CallerPermissions) }
+
+    . $FunctionPath
+    . (Join-Path (Split-Path -Parent $FunctionPath) 'Invoke-ExecCippGlobalReplacemap.ps1')
+    . (Join-Path (Split-Path -Parent $FunctionPath) 'Invoke-ExecCippGroupReplacemap.ps1')
+    . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/Authentication/Select-CippAllowedTenantData.ps1')
+    . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/Get-CippErrorStatusCode.ps1')
+    . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/ConvertTo-CIPPODataFilterValue.ps1')
+
+    function New-SaveRequest {
+        param(
+            [string]$Name = 'wallpaperpath',
+            $Value = 'C:\Wallpapers\corp.png',
+            $VariableType,
+            [string]$TenantId = 'AllTenants'
+        )
+        $Body = [pscustomobject]@{
+            Action      = 'AddEdit'
+            tenantId    = $TenantId
+            RowKey      = $Name
+            Value       = $Value
+            Description = 'A test variable'
+        }
+        if ($PSBoundParameters.ContainsKey('VariableType')) {
+            $Body | Add-Member -NotePropertyName 'VariableType' -NotePropertyValue $VariableType
+        }
+        return [pscustomobject]@{
+            Params  = @{ CIPPEndpoint = 'ExecCippReplacemap' }
+            Headers = @{ Authorization = 'token' }
+            Query   = @{}
+            Body    = $Body
+        }
+    }
+
+    function New-ListRequest {
+        param([string]$TenantId = 'contoso.onmicrosoft.com', [bool]$IncludeGlobal = $true)
+        $Query = @{ Action = 'List'; tenantId = $TenantId }
+        if ($IncludeGlobal) { $Query['includeGlobal'] = 'true' }
+        return [pscustomobject]@{
+            Params  = @{ CIPPEndpoint = 'ExecCippReplacemap' }
+            Headers = @{}
+            Query   = $Query
+            Body    = [pscustomobject]@{}
+        }
+    }
+
+    function New-UsageRequest {
+        return [pscustomobject]@{
+            Params  = @{ CIPPEndpoint = 'ExecCippReplacemap' }
+            Headers = @{}
+            Query   = @{ Action = 'Usage' }
+            Body    = [pscustomobject]@{}
+        }
+    }
+}
+
+Describe 'Invoke-ExecCippReplacemap - variable types' {
+    BeforeEach {
+        $script:SavedEntity = $null
+        $script:RemovedEntity = $null
+        $script:ExistingEntity = $null
+        $script:AllRows = @()
+        $script:RowsByFilter = @{}
+        $script:AllTenants = @(
+            [pscustomobject]@{ customerId = 'contoso-id'; displayName = 'Contoso Ltd' }
+            [pscustomobject]@{ customerId = 'fabrikam-id'; displayName = 'Fabrikam Inc' }
+        )
+
+        Mock -CommandName Get-CIPPTable -MockWith { @{} }
+        Mock -CommandName Get-Tenants -MockWith {
+            param($TenantFilter, [switch]$IncludeAll)
+            if ($IncludeAll) { return $script:AllTenants }
+            [pscustomobject]@{ customerId = '11111111-1111-1111-1111-111111111111' }
+        }
+    }
+
+    Context 'the type is optional' {
+        It 'defaults to string when no type is sent' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest)
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.VariableType | Should -Be 'string'
+            $script:SavedEntity.Value | Should -Be 'C:\Wallpapers\corp.png'
+            $script:SavedEntity.RowKey | Should -Be 'wallpaperpath'
+        }
+
+        It 'defaults to string when the type is sent empty' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -VariableType '')
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.VariableType | Should -Be 'string'
+        }
+    }
+
+    Context 'accepted types' {
+        It 'stores a valid integer variable' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'lockseconds' -Value '300' -VariableType 'integer')
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.VariableType | Should -Be 'integer'
+        }
+
+        It 'stores a valid boolean variable' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'requirepw' -Value 'true' -VariableType 'boolean')
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.VariableType | Should -Be 'boolean'
+        }
+
+        It 'stores a valid json variable' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'allowedapps' -Value '["word.exe","excel.exe"]' -VariableType 'json')
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.VariableType | Should -Be 'json'
+        }
+
+        It 'stores a valid list variable, empty included' {
+            foreach ($Value in @('["Site A","Site B"]', '[]')) {
+                $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'sites' -Value $Value -VariableType 'list')
+
+                $Response.StatusCode | Should -Be 200
+                $script:SavedEntity.VariableType | Should -Be 'list'
+                $script:SavedEntity.Value | Should -Be $Value
+            }
+        }
+
+        It 'stores a list typed one value per line as a JSON array' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'sites' -Value "Site A`r`n  Site, B `n`nSite `"C`"" -VariableType 'list')
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.Value | Should -Be '["Site A","Site, B","Site \"C\""]'
+        }
+
+        It 'stores a collection typed one value per line as a JSON array' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'tenants' -Value "tenant-a`ntenant-b" -VariableType 'collection')
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.VariableType | Should -Be 'collection'
+            $script:SavedEntity.Value | Should -Be '["tenant-a","tenant-b"]'
+        }
+
+        It 'stores a single line as a one item list' {
+            $null = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'sites' -Value 'Site A' -VariableType 'list')
+            $script:SavedEntity.Value | Should -Be '["Site A"]'
+        }
+
+        It 'stores lines that start with a bracket as values, not as JSON' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'locations' -Value "[HQ] Office Allow`n[HQ] VPN Allow" -VariableType 'list')
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.Value | Should -Be '["[HQ] Office Allow","[HQ] VPN Allow"]'
+        }
+
+        It 'accepts the {label, value} shape the type selector posts' {
+            $Response = Invoke-ExecCippReplacemap -Request (
+                New-SaveRequest -Name 'lockseconds' -Value '300' -VariableType ([pscustomobject]@{ label = 'Integer'; value = 'integer' })
+            )
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.VariableType | Should -Be 'integer'
+        }
+    }
+
+    Context 'a value that does not match its declared type is rejected' {
+        It 'rejects a non-numeric integer' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'lockseconds' -Value 'not-a-number' -VariableType 'integer')
+
+            $Response.StatusCode | Should -Be 400
+            $Response.Body.Results | Should -Match 'not a whole number'
+            $script:SavedEntity | Should -BeNullOrEmpty
+        }
+
+        It 'rejects a non-boolean boolean' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'requirepw' -Value 'maybe' -VariableType 'boolean')
+
+            $Response.StatusCode | Should -Be 400
+            $Response.Body.Results | Should -Match 'not true or false'
+            $script:SavedEntity | Should -BeNullOrEmpty
+        }
+
+        It 'rejects malformed json' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'allowedapps' -Value '{not json' -VariableType 'json')
+
+            $Response.StatusCode | Should -Be 400
+            $Response.Body.Results | Should -Match 'not valid JSON'
+            $script:SavedEntity | Should -BeNullOrEmpty
+        }
+
+        It 'rejects a list that is not a JSON array' {
+            foreach ($Value in @('{"a":1}', '["Site A",')) {
+                $script:SavedEntity = $null
+                $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'sites' -Value $Value -VariableType 'list')
+
+                $Response.StatusCode | Should -Be 400 -Because $Value
+                $Response.Body.Results | Should -Match 'not a JSON array'
+                $script:SavedEntity | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'rejects an unknown type' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -VariableType 'decimal')
+
+            $Response.StatusCode | Should -Be 400
+            $Response.Body.Results | Should -Match 'not a valid variable type'
+            $script:SavedEntity | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'variable names' {
+        It 'rejects <Name>' -ForEach @(
+            @{ Name = 'an empty name'; RowKey = '' }
+            @{ Name = 'a blank name'; RowKey = '  ' }
+            @{ Name = 'a space'; RowKey = 'has space' }
+            @{ Name = 'a percent sign'; RowKey = 'pct%x' }
+            @{ Name = 'a quote'; RowKey = "quo'te" }
+            @{ Name = 'brackets'; RowKey = 'brk[0]' }
+        ) {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name $RowKey)
+
+            $Response.StatusCode | Should -Be 400
+            $script:SavedEntity | Should -BeNullOrEmpty
+        }
+
+        It 'accepts <RowKey>' -ForEach @(@{ RowKey = 'site_code' }, @{ RowKey = 'dot.0' }, @{ RowKey = 'paren(x)' }) {
+            (Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name $RowKey)).StatusCode | Should -Be 200
+            $script:SavedEntity.RowKey | Should -Be $RowKey
+        }
+    }
+    Context 'values at the edges of each type' {
+        It 'accepts zero and negative integers' {
+            foreach ($Value in @('0', '-5')) {
+                $script:SavedEntity = $null
+                $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'n' -Value $Value -VariableType 'integer')
+                $Response.StatusCode | Should -Be 200 -Because "$Value is a whole number"
+            }
+        }
+
+        It 'accepts the alternate boolean spellings the substitution understands' {
+            foreach ($Value in @('true', 'false', '1', '0', 'yes', 'no')) {
+                $script:SavedEntity = $null
+                $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'b' -Value $Value -VariableType 'boolean')
+                $Response.StatusCode | Should -Be 200 -Because "$Value is a recognised boolean"
+            }
+        }
+
+        It 'accepts a json object as well as an array' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -Name 'cfg' -Value '{"a":1,"b":[2,3]}' -VariableType 'json')
+            $Response.StatusCode | Should -Be 200
+        }
+    }
+
+    Context 'existing behaviour is preserved' {
+        It 'still resolves a tenant to its customerId' {
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -TenantId 'contoso.onmicrosoft.com')
+
+            $Response.StatusCode | Should -Be 200
+            $script:SavedEntity.PartitionKey | Should -Be '11111111-1111-1111-1111-111111111111'
+        }
+
+        It 'rejects a request without a tenantId instead of matching every tenant' {
+            Mock -CommandName Get-Tenants -MockWith { throw 'must not look up tenants without a tenantId' }
+            $Request = New-SaveRequest
+            $Request.Body.PSObject.Properties.Remove('tenantId')
+
+            $Response = Invoke-ExecCippReplacemap -Request $Request
+
+            $Response.StatusCode | Should -Be 400
+            $Response.Body.Results | Should -BeLike 'Provide tenantId*'
+            $script:SavedEntity | Should -BeNullOrEmpty
+        }
+
+        It 'returns 404 for a tenant that does not exist' {
+            Mock -CommandName Get-Tenants -MockWith { }
+
+            $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -TenantId 'gone.onmicrosoft.com')
+
+            $Response.StatusCode | Should -Be 404
+            $Response.Body.Results | Should -Be "Tenant 'gone.onmicrosoft.com' was not found."
+            $script:SavedEntity | Should -BeNullOrEmpty
+        }
+
+        It 'still deletes a variable' {
+            $script:ExistingEntity = [pscustomobject]@{ PartitionKey = 'AllTenants'; RowKey = 'wallpaperpath' }
+            $Request = [pscustomobject]@{
+                Params  = @{ CIPPEndpoint = 'ExecCippReplacemap' }
+                Headers = @{}
+                Query   = @{}
+                Body    = [pscustomobject]@{ Action = 'Delete'; tenantId = 'AllTenants'; RowKey = 'wallpaperpath' }
+            }
+
+            $Response = Invoke-ExecCippReplacemap -Request $Request
+
+            $Response.StatusCode | Should -Be 200
+            $script:RemovedEntity.RowKey | Should -Be 'wallpaperpath'
+        }
+        It 'cannot widen the delete filter to another partition through the name' {
+            $script:RowsByFilter = @{}
+            $script:ExistingEntity = $null
+            $Name = "x' or PartitionKey eq 'other-tenant' and RowKey eq 'secret"
+            $Request = [pscustomobject]@{
+                Params  = @{ CIPPEndpoint = 'ExecCippReplacemap' }
+                Headers = @{}
+                Query   = @{}
+                Body    = [pscustomobject]@{ Action = 'Delete'; tenantId = 'contoso.onmicrosoft.com'; RowKey = $Name }
+            }
+            Mock -CommandName Get-CIPPAzDataTableEntity -MockWith { param($Filter) $script:LastFilter = $Filter }
+
+            $Response = Invoke-ExecCippReplacemap -Request $Request
+
+            $script:LastFilter | Should -BeExactly "PartitionKey eq '11111111-1111-1111-1111-111111111111' and RowKey eq 'x'' or PartitionKey eq ''other-tenant'' and RowKey eq ''secret'"
+            $Response.StatusCode | Should -Be 404
+            $script:RemovedEntity | Should -BeNullOrEmpty
+        }
+    }
+}
+
+Describe 'Global variables need Tenant.GlobalVariables.ReadWrite' {
+    BeforeEach {
+        $script:SavedEntity = $null
+        $script:RemovedEntity = $null
+        $script:ExistingEntity = [pscustomobject]@{ PartitionKey = 'AllTenants'; RowKey = 'wallpaperpath' }
+        $script:CallerPermissions = @('Tenant.Config.ReadWrite')
+        Mock -CommandName Get-Tenants -MockWith { [pscustomobject]@{ customerId = '11111111-1111-1111-1111-111111111111' } }
+    }
+    AfterEach { $script:CallerPermissions = @('Tenant.Config.ReadWrite', 'Tenant.GlobalVariables.ReadWrite') }
+
+    It 'refuses a global <Action> without it' -ForEach @(@{ Action = 'AddEdit' }, @{ Action = 'Delete' }) {
+        $Request = New-SaveRequest
+        $Request.Body.Action = $Action
+
+        $Response = Invoke-ExecCippReplacemap -Request $Request
+
+        $Response.StatusCode | Should -Be 403
+        $script:SavedEntity | Should -BeNullOrEmpty
+        $script:RemovedEntity | Should -BeNullOrEmpty
+    }
+
+    It 'still saves a tenant variable without it' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -TenantId 'contoso.onmicrosoft.com')
+
+        $Response.StatusCode | Should -Be 200
+        $script:SavedEntity.PartitionKey | Should -Be '11111111-1111-1111-1111-111111111111'
+    }
+
+    It 'still lists global variables without it' {
+        $Request = [pscustomobject]@{ Params = @{ CIPPEndpoint = 'ExecCippReplacemap' }; Headers = @{}; Query = @{ Action = 'List'; tenantId = 'AllTenants' }; Body = $null }
+
+        (Invoke-ExecCippReplacemap -Request $Request).StatusCode | Should -Be 200
+    }
+
+    It 'saves through ExecCippGlobalReplacemap with it' {
+        $script:CallerPermissions = @('Tenant.GlobalVariables.ReadWrite')
+
+        $Response = Invoke-ExecCippGlobalReplacemap -Request (New-SaveRequest)
+
+        $Response.StatusCode | Should -Be 200
+        $script:SavedEntity.PartitionKey | Should -Be 'AllTenants'
+    }
+
+    It 'keeps ExecCippGlobalReplacemap to global writes' {
+        $script:CallerPermissions = @('Tenant.GlobalVariables.ReadWrite')
+
+        $Response = Invoke-ExecCippGlobalReplacemap -Request (New-SaveRequest -TenantId 'contoso.onmicrosoft.com')
+
+        $Response.StatusCode | Should -Be 400
+        $script:SavedEntity | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Invoke-ExecCippReplacemap - Usage' {
+    BeforeEach {
+        $script:SavedEntity = $null
+        $script:AllTenants = @(
+            [pscustomobject]@{ customerId = 'contoso-id'; displayName = 'Contoso Ltd' }
+            [pscustomobject]@{ customerId = 'fabrikam-id'; displayName = 'Fabrikam Inc' }
+        )
+        $script:AllRows = @(
+            [pscustomobject]@{ PartitionKey = 'AllTenants'; RowKey = 'wallpaperpath'; Value = 'C:\Global'; VariableType = 'string' }
+            [pscustomobject]@{ PartitionKey = 'contoso-id'; RowKey = 'wallpaperpath'; Value = 'C:\Contoso'; VariableType = 'string' }
+            [pscustomobject]@{ PartitionKey = 'fabrikam-id'; RowKey = 'wallpaperpath'; Value = 'C:\Fabrikam'; VariableType = 'string' }
+            [pscustomobject]@{ PartitionKey = 'contoso-id'; RowKey = 'lockseconds'; Value = '300'; VariableType = 'integer' }
+            [pscustomobject]@{ PartitionKey = 'fabrikam-id'; RowKey = 'lockseconds'; Value = '900'; VariableType = 'integer' }
+            [pscustomobject]@{ PartitionKey = 'contoso-id'; RowKey = 'legacyvar'; Value = 'old' }
+            [pscustomobject]@{ PartitionKey = 'deleted-tenant-id'; RowKey = 'driftvar'; Value = 'true'; VariableType = 'boolean' }
+            [pscustomobject]@{ PartitionKey = 'contoso-id'; RowKey = 'driftvar'; Value = 'yes-ish'; VariableType = 'string' }
+        )
+        Mock -CommandName Get-CIPPTable -MockWith { @{} }
+        Mock -CommandName Get-Tenants -MockWith {
+            param($TenantFilter, [switch]$IncludeAll)
+            if ($IncludeAll) { return $script:AllTenants }
+            [pscustomobject]@{ customerId = 'contoso-id' }
+        }
+    }
+
+    It 'shows a tenant-restricted caller only global rows and their own tenants' {
+        $script:CippAllowedTenantsStorage = [pscustomobject]@{ Value = @('contoso-id') }
+        try {
+            $Response = Invoke-ExecCippReplacemap -Request (New-UsageRequest)
+        } finally {
+            $script:CippAllowedTenantsStorage = $null
+        }
+
+        $Tenants = @($Response.Body.Results.Definitions.TenantId | Sort-Object -Unique)
+        $Tenants | Should -Be @('AllTenants', 'contoso-id')
+    }
+
+    It 'shows a caller with no tenants only global rows' {
+        $script:CippAllowedTenantsStorage = [pscustomobject]@{ Value = @() }
+        try {
+            $Response = Invoke-ExecCippReplacemap -Request (New-UsageRequest)
+        } finally {
+            $script:CippAllowedTenantsStorage = $null
+        }
+
+        @($Response.Body.Results.Definitions.TenantId | Sort-Object -Unique) | Should -Be @('AllTenants')
+    }
+
+    It 'groups every definition of a name across tenants' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-UsageRequest)
+        $Wallpaper = $Response.Body.Results | Where-Object { $_.Name -eq 'wallpaperpath' }
+
+        $Wallpaper.TenantCount | Should -Be 2
+        $Wallpaper.HasGlobal | Should -BeTrue
+        @($Wallpaper.Definitions).Count | Should -Be 3
+        ($Wallpaper.Definitions | Where-Object { $_.Scope -eq 'Tenant' }).TenantName | Should -Contain 'Contoso Ltd'
+    }
+
+    It 'needs no tenantId' {
+        # The action is answered before the tenant guard, so a missing tenantId is not an error.
+        $Response = Invoke-ExecCippReplacemap -Request (New-UsageRequest)
+        $Response.StatusCode | Should -Be 200
+    }
+
+    It 'suggests the global type when there is one' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-UsageRequest)
+        ($Response.Body.Results | Where-Object { $_.Name -eq 'wallpaperpath' }).SuggestedType | Should -Be 'string'
+    }
+
+    It 'suggests the most common tenant type when there is no global definition' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-UsageRequest)
+        $Lock = $Response.Body.Results | Where-Object { $_.Name -eq 'lockseconds' }
+
+        $Lock.HasGlobal | Should -BeFalse
+        $Lock.SuggestedType | Should -Be 'integer'
+        $Lock.TypesConsistent | Should -BeTrue
+    }
+
+    It 'flags a name that is typed differently in different tenants' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-UsageRequest)
+        $Drift = $Response.Body.Results | Where-Object { $_.Name -eq 'driftvar' }
+
+        $Drift.TypesConsistent | Should -BeFalse
+        @($Drift.Types) | Should -Be @('boolean', 'string')
+    }
+
+    It 'reports an untyped row as string' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-UsageRequest)
+        $Legacy = $Response.Body.Results | Where-Object { $_.Name -eq 'legacyvar' }
+        $Legacy.Definitions[0].VariableType | Should -Be 'string'
+    }
+
+    It 'falls back to the partition key when a tenant no longer resolves' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-UsageRequest)
+        $Drift = $Response.Body.Results | Where-Object { $_.Name -eq 'driftvar' }
+        $Drift.Definitions.TenantName | Should -Contain 'deleted-tenant-id'
+    }
+}
+
+Describe 'Invoke-ExecCippReplacemap - List marks overridden variables' {
+    BeforeEach {
+        $script:ExistingEntity = $null
+        $script:AllRows = @()
+        # One row per partition, keyed by the filter the function builds for each.
+        $script:RowsByFilter = @{
+            "PartitionKey eq 'AllTenants'"  = @(
+                [pscustomobject]@{ PartitionKey = 'AllTenants'; RowKey = 'wallpaperpath'; Value = 'C:\Global' }
+                [pscustomobject]@{ PartitionKey = 'AllTenants'; RowKey = 'globalonly'; Value = 'only-global' }
+            )
+            "PartitionKey eq 'contoso-id'" = @(
+                [pscustomobject]@{ PartitionKey = 'contoso-id'; RowKey = 'wallpaperpath'; Value = 'C:\Contoso' }
+                [pscustomobject]@{ PartitionKey = 'contoso-id'; RowKey = 'tenantonly'; Value = 'local' }
+            )
+        }
+        Mock -CommandName Get-CIPPTable -MockWith { @{} }
+        Mock -CommandName Get-Tenants -MockWith { [pscustomobject]@{ customerId = 'contoso-id' } }
+    }
+
+    It 'reports a tenant value that shadows a global one as Overridden' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-ListRequest)
+        $Row = $Response.Body.Results | Where-Object { $_.RowKey -eq 'wallpaperpath' }
+
+        @($Row).Count | Should -Be 1 -Because 'the shadowed global is dropped from the list'
+        $Row.Scope | Should -Be 'Overridden'
+        $Row.Value | Should -Be 'C:\Contoso'
+    }
+
+    It 'leaves a tenant-only variable as Tenant' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-ListRequest)
+        ($Response.Body.Results | Where-Object { $_.RowKey -eq 'tenantonly' }).Scope | Should -Be 'Tenant'
+    }
+
+    It 'leaves an unshadowed global as Global' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-ListRequest)
+        ($Response.Body.Results | Where-Object { $_.RowKey -eq 'globalonly' }).Scope | Should -Be 'Global'
+    }
+
+    It 'never reports Overridden when globals are not being included' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-ListRequest -IncludeGlobal $false)
+        @($Response.Body.Results | Where-Object { $_.Scope -eq 'Overridden' }).Count | Should -Be 0
+        ($Response.Body.Results | Where-Object { $_.RowKey -eq 'wallpaperpath' }).Scope | Should -Be 'Tenant'
+    }
+
+    It 'reports every row on the global page as Global' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-ListRequest -TenantId 'AllTenants')
+        @($Response.Body.Results | Where-Object { $_.Scope -ne 'Global' }).Count | Should -Be 0
+    }
+}
+
+Describe 'Invoke-ExecCippReplacemap - tenant group variables' {
+    BeforeEach {
+        $script:SavedEntity = $null
+        $script:ExistingEntity = $null
+        $script:AllRows = @()
+        $script:GroupVariables = $null
+        $script:AllowedGroups = @('AllGroups')
+        $script:CallerPermissions = @('Tenant.Groups.ReadWrite')
+        $script:RowsByFilter = @{
+            "PartitionKey eq 'TenantGroup' and RowKey eq 'g1'" = [pscustomobject]@{ PartitionKey = 'TenantGroup'; RowKey = 'g1'; Name = 'Allow OneDrive' }
+            "PartitionKey eq 'AllTenants'"                     = @(
+                [pscustomobject]@{ PartitionKey = 'AllTenants'; RowKey = 'onedrive'; Value = 'block' }
+                [pscustomobject]@{ PartitionKey = 'AllTenants'; RowKey = 'aiblock'; Value = 'global' }
+            )
+            "PartitionKey eq 'contoso-id'"                     = @([pscustomobject]@{ PartitionKey = 'contoso-id'; RowKey = 'tenantwins'; Value = 'local' })
+            "PartitionKey eq 'group:g1'"                       = @([pscustomobject]@{ PartitionKey = 'group:g1'; RowKey = 'onedrive'; Value = 'allow' })
+        }
+        Mock -CommandName Get-CIPPTable -MockWith { @{} }
+        Mock -CommandName Get-Tenants -MockWith { [pscustomobject]@{ customerId = 'contoso-id' } }
+    }
+    AfterEach {
+        $script:GroupVariables = $null
+        $script:RowsByFilter = $null
+        $script:AllowedGroups = @('AllGroups')
+        $script:CallerPermissions = @('Tenant.Config.ReadWrite', 'Tenant.GlobalVariables.ReadWrite')
+    }
+
+    It 'saves a variable to the group partition with the tenant group permission alone' {
+        $Response = Invoke-ExecCippGroupReplacemap -Request (New-SaveRequest -TenantId 'group:g1')
+        $Response.StatusCode | Should -Be 200
+        $script:SavedEntity.PartitionKey | Should -Be 'group:g1'
+    }
+
+    It 'keeps ExecCippGroupReplacemap to group variables' {
+        $Response = Invoke-ExecCippGroupReplacemap -Request (New-SaveRequest -TenantId 'contoso.onmicrosoft.com')
+        $Response.StatusCode | Should -Be 400
+        $script:SavedEntity | Should -BeNullOrEmpty
+    }
+
+    It 'returns 404 for a group that does not exist' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -TenantId 'group:missing')
+        $Response.StatusCode | Should -Be 404
+        $script:SavedEntity | Should -BeNullOrEmpty
+    }
+
+    It 'needs Tenant.Groups.ReadWrite to change a group variable' {
+        $script:CallerPermissions = @('Tenant.Config.ReadWrite', 'Tenant.GlobalVariables.ReadWrite')
+        $Response = Invoke-ExecCippReplacemap -Request (New-SaveRequest -TenantId 'group:g1')
+        $Response.StatusCode | Should -Be 403
+        $script:SavedEntity | Should -BeNullOrEmpty
+    }
+
+    It 'refuses a role scoped to particular tenant groups, as managing the group does' {
+        $script:AllowedGroups = @('g1')
+        $Response = Invoke-ExecCippGroupReplacemap -Request (New-SaveRequest -TenantId 'group:g1')
+        $Response.StatusCode | Should -Be 403
+        $script:SavedEntity | Should -BeNullOrEmpty
+    }
+
+    It 'lists a group page as Group' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-ListRequest -TenantId 'group:g1' -IncludeGlobal $false)
+        @($Response.Body.Results).RowKey | Should -Be @('onedrive')
+        @($Response.Body.Results).Scope | Should -Be @('Group')
+    }
+
+    It 'shows a tenant the group value in place of the global one' {
+        $script:GroupVariables = @{ onedrive = @{ Value = 'allow'; VariableType = 'string'; Groups = [System.Collections.Generic.List[string]]@('Allow OneDrive'); Conflict = $false } }
+        $Rows = @((Invoke-ExecCippReplacemap -Request (New-ListRequest)).Body.Results | Where-Object { $_.RowKey -eq 'onedrive' })
+        $Rows.Count | Should -Be 1
+        $Rows[0].Scope | Should -Be 'Group'
+        $Rows[0].Value | Should -Be 'allow'
+        $Rows[0].Groups | Should -Be 'Allow OneDrive'
+    }
+
+    It 'lists a conflict next to the global value it falls back to' {
+        $script:GroupVariables = @{ aiblock = @{ Value = 'a'; VariableType = 'string'; Groups = [System.Collections.Generic.List[string]]@('One', 'Two'); Conflict = $true } }
+        $Rows = @((Invoke-ExecCippReplacemap -Request (New-ListRequest)).Body.Results | Where-Object { $_.RowKey -eq 'aiblock' })
+        @($Rows.Scope | Sort-Object) | Should -Be @('Conflict', 'Global')
+    }
+
+    It 'marks a tenant value that shadows a group one as Overridden' {
+        $script:GroupVariables = @{ tenantwins = @{ Value = 'group'; VariableType = 'string'; Groups = [System.Collections.Generic.List[string]]@('One'); Conflict = $false } }
+        $Rows = @((Invoke-ExecCippReplacemap -Request (New-ListRequest)).Body.Results | Where-Object { $_.RowKey -eq 'tenantwins' })
+        $Rows.Count | Should -Be 1
+        $Rows[0].Scope | Should -Be 'Overridden'
+        $Rows[0].Value | Should -Be 'local'
+    }
+}
+
+Describe 'Invoke-ExecCippReplacemap - a failed read' {
+    BeforeEach {
+        Mock -CommandName Get-CIPPTable -MockWith { @{} }
+        Mock -CommandName Get-Tenants -MockWith { [pscustomobject]@{ customerId = 'contoso-id' } }
+    }
+
+    It 'fails when the <Read> read fails' -ForEach @(
+        @{ Read = 'List tenant'; Action = 'List'; Failing = "PartitionKey eq 'contoso-id'" }
+        @{ Read = 'List global'; Action = 'List'; Failing = "PartitionKey eq 'AllTenants'" }
+        @{ Read = 'Usage'; Action = 'Usage'; Failing = $null }
+    ) {
+        $script:FailingFilter = $Failing
+        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
+            param($Filter)
+            if ($Filter -eq $script:FailingFilter) { Write-Error 'The server is busy.' }
+        }
+        $Request = if ($Action -eq 'Usage') { New-UsageRequest } else { New-ListRequest }
+
+        $Response = Invoke-ExecCippReplacemap -Request $Request
+
+        $Response.StatusCode | Should -Be 500
+        $Response.Body.Results | Should -BeLike '*server is busy*'
+    }
+
+    It 'fails when the Delete read fails' {
+        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith { Write-Error 'The server is busy.' }
+        $Request = New-SaveRequest -TenantId 'contoso.onmicrosoft.com'
+        $Request.Body.Action = 'Delete'
+
+        $Response = Invoke-ExecCippReplacemap -Request $Request
+
+        $Response.StatusCode | Should -Be 500
+        $Response.Body.Results | Should -BeLike '*server is busy*'
+    }
+}
+
+Describe 'Invoke-ExecCippReplacemap - Preview' {
+    BeforeAll {
+        function Get-CIPPTextReplacement { param($TenantFilter, $Text, [switch]$EscapeForJson) }
+        function New-PreviewRequest {
+            param([string]$TenantId = 'contoso.onmicrosoft.com', $Text)
+            [pscustomobject]@{
+                Params  = @{ CIPPEndpoint = 'ExecCippReplacemap' }
+                Headers = @{}
+                Query   = @{}
+                Body    = [pscustomobject]@{ Action = 'Preview'; tenantId = $TenantId; Text = $Text }
+            }
+        }
+    }
+
+    BeforeEach {
+        Mock -CommandName Get-Tenants -MockWith { [pscustomobject]@{ customerId = 'contoso-id' } }
+        Mock -CommandName Get-CIPPTextReplacement -MockWith { "resolved:${TenantFilter}:${Text}:$($EscapeForJson.IsPresent)" }
+    }
+
+    It 'resolves the text for the tenant' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-PreviewRequest -Text 'mail+%initialdomainprefix%@example.com')
+
+        $Response.StatusCode | Should -Be 200
+        $Response.Body.Results | Should -Be 'resolved:contoso-id:mail+%initialdomainprefix%@example.com:False'
+    }
+
+    It 'escapes values for JSON when the text is JSON' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-PreviewRequest -Text '{"name":"%tenantname%"}')
+
+        $Response.Body.Results | Should -BeLike '*:True'
+    }
+
+    It 'rejects <Name>' -ForEach @(
+        @{ Name = 'global scope'; TenantId = 'AllTenants'; Text = '%tenantname%' }
+        @{ Name = 'empty text'; TenantId = 'contoso.onmicrosoft.com'; Text = ' ' }
+    ) {
+        $Response = Invoke-ExecCippReplacemap -Request (New-PreviewRequest -TenantId $TenantId -Text $Text)
+
+        $Response.StatusCode | Should -Be 400
+        Should -Invoke Get-CIPPTextReplacement -Times 0
+    }
+}
+
+Describe 'Invoke-ExecCippReplacemap - PreviewValue' {
+    BeforeAll {
+        . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/Get-CIPPTextReplacement.ps1')
+        function New-PreviewValueRequest {
+            param([string]$TenantId = 'AllTenants', $Value, $VariableType)
+            [pscustomobject]@{
+                Params  = @{ CIPPEndpoint = 'ExecCippReplacemap' }
+                Headers = @{}
+                Query   = @{}
+                Body    = [pscustomobject]@{ Action = 'PreviewValue'; tenantId = $TenantId; RowKey = 'partners'; Value = $Value; VariableType = $VariableType }
+            }
+        }
+        function Get-PreviewResult {
+            param($Response, [string]$Usage)
+            @($Response.Body.Results).Where({ $_.Usage -eq $Usage })[0].Result
+        }
+    }
+
+    BeforeEach {
+        $script:SavedEntity = $null
+        $script:ExistingEntity = $null
+        $script:RowsByFilter = @{}
+        $script:CIPPVariableMemo = $null
+        # Only the tenant group lookup finds a row; the variable table is empty.
+        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith { param($Filter) if ($Filter -like "*'TenantGroup'*") { [pscustomobject]@{ RowKey = 'g1'; Name = 'Group 1' } } }
+        Mock -CommandName Get-Tenants -MockWith {
+            [pscustomobject]@{ customerId = '11111111-1111-1111-1111-111111111111'; defaultDomainName = 'contoso.onmicrosoft.com'; displayName = 'Contoso' }
+        }
+    }
+
+    It 'shows a collection typed one per line in every position, without saving it' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-PreviewValueRequest -Value "a`nb" -VariableType 'collection')
+
+        $Response.StatusCode | Should -Be 200
+        Get-PreviewResult $Response 'A field' | Should -Be '["a","b"]'
+        Get-PreviewResult $Response 'A list entry' | Should -Be '["a","b"]'
+        Get-PreviewResult $Response 'An Intune list entry' | Should -Be '[{"value":"a"},{"value":"b"}]'
+        Get-PreviewResult $Response 'Inside text' | Should -Be '"Text a, b text"'
+        $script:SavedEntity | Should -BeNullOrEmpty
+    }
+
+    It 'shows a list nesting the array inside an Intune list entry' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-PreviewValueRequest -Value "a`nb" -VariableType 'list')
+
+        Get-PreviewResult $Response 'An Intune list entry' | Should -Be '[{"value":["a","b"]}]'
+    }
+
+    It 'resolves tenant tokens on a tenant, and leaves them as typed on <Name>' -ForEach @(
+        @{ Name = 'global variables'; TenantId = 'AllTenants'; Expected = '"%tenantid%"' }
+        @{ Name = 'a tenant group'; TenantId = 'group:g1'; Expected = '"%tenantid%"' }
+        @{ Name = 'a tenant'; TenantId = 'contoso.onmicrosoft.com'; Expected = '"11111111-1111-1111-1111-111111111111"' }
+    ) {
+        $Response = Invoke-ExecCippReplacemap -Request (New-PreviewValueRequest -TenantId $TenantId -Value '%tenantid%' -VariableType 'string')
+
+        Get-PreviewResult $Response 'A field' | Should -Be $Expected
+    }
+
+    It 'rejects a value that does not match its type, as saving would' {
+        $Response = Invoke-ExecCippReplacemap -Request (New-PreviewValueRequest -Value 'abc' -VariableType 'integer')
+
+        $Response.StatusCode | Should -Be 400
+        $Response.Body.Results | Should -BeLike "*not a whole number*"
+    }
+}

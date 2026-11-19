@@ -19,8 +19,18 @@ function New-GraphGetRequest {
         [hashtable]$extraHeaders,
         [switch]$ReturnRawResponse,
         [switch]$SkipValueExtraction,
+        # Emit each page straight to the pipeline instead of buffering the whole
+        # paginated result. Peak memory becomes one page rather than the entire
+        # dataset — use for large collections piped into a streaming consumer
+        # (e.g. Set-CIPPDBCache* | Add-CIPPDbItem). Trade-off: on a mid-pagination
+        # failure, pages already emitted have flowed downstream before the throw.
+        [switch]$Stream,
+        [switch]$UseCertificate,
         $Headers
     )
+
+    Assert-CIPPMicrosoftHost -Uri $uri
+    if ($scope -like '*.sharepoint*') { Assert-CIPPSharePointHost -Uri $uri -Scope $scope }
 
     if ($NoAuthCheck -eq $false) {
         $IsAuthorised = Get-AuthorisedRequest -Uri $uri -TenantID $tenantid
@@ -32,11 +42,10 @@ function New-GraphGetRequest {
         if ($headers) {
             $headers = $Headers
         } else {
-            if ($scope -eq 'ExchangeOnline') {
-                $headers = Get-GraphToken -tenantid $tenantid -scope 'https://outlook.office365.com/.default' -AsApp $asapp -SkipCache $skipTokenCache
-            } else {
-                $headers = Get-GraphToken -tenantid $tenantid -scope $scope -AsApp $asapp -SkipCache $skipTokenCache
-            }
+            $TokenScope = if ($scope -eq 'ExchangeOnline') { 'https://outlook.office365.com/.default' } else { $scope }
+            # -UseCertificate authenticates the app with the SAM certificate instead of the
+            # client secret: delegated (refresh token) by default, app-only with -AsApp $true
+            $headers = Get-GraphToken -tenantid $tenantid -scope $TokenScope -AsApp $asapp -SkipCache $skipTokenCache -UseCertificate:$UseCertificate
         }
         if ($ComplexFilter) {
             $headers['ConsistencyLevel'] = 'eventual'
@@ -54,11 +63,15 @@ function New-GraphGetRequest {
         }
 
         if (!$headers['User-Agent']) {
-            $headers['User-Agent'] = Get-CippUserAgent
+            $headers['User-Agent'] = Get-CippUserAgent -SharePoint:($uri -match '^https://[^/]+\.sharepoint(-[a-z]+)?\.')
         }
 
 
-        $ReturnedData = do {
+        # Pagination loop. Its per-page output ($data.value etc.) is either buffered
+        # into $ReturnedData and returned (default), or streamed straight to the
+        # pipeline (-Stream). Same loop body either way — see the dispatch below.
+        $Pager = {
+            do {
             $RetryCount = 0
             $MaxRetries = 3
             $RequestSuccessful = $false
@@ -74,7 +87,9 @@ function New-GraphGetRequest {
 
                     if ($ReturnRawResponse) {
                         $GraphRequest.SkipHttpErrorCheck = $true
-                        $Data = Invoke-WebRequest @GraphRequest
+                        $GraphRequest.StatusCodeVariable = 'RawStatusCode'
+                        $GraphRequest.ResponseHeadersVariable = 'ResponseHeaders'
+                        $Data = Invoke-CIPPRestMethod @GraphRequest
                     } else {
                         $GraphRequest.ResponseHeadersVariable = 'ResponseHeaders'
                         $Data = (Invoke-CIPPRestMethod @GraphRequest)
@@ -85,21 +100,13 @@ function New-GraphGetRequest {
                     $RequestSuccessful = $true
 
                     if ($ReturnRawResponse) {
-                        try {
-                            if ($Data.Content -and (Test-Json -Json $Data.Content -ErrorAction Stop)) {
-                                $Content = $Data.Content | ConvertFrom-Json
-                            } else {
-                                $Content = $Data.Content
-                            }
-                        } catch {
-                            $Content = $Data.Content
-                        }
-
+                        $RawHeaders = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.IEnumerable[string]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                        foreach ($Key in $ResponseHeaders.Keys) { $RawHeaders[$Key] = [string[]]@($ResponseHeaders[$Key]) }
                         [PSCustomObject]@{
-                            StatusCode        = $Data.StatusCode
-                            StatusDescription = $Data.StatusDescription
-                            Content           = $Content
-                            Headers           = $Data.Headers
+                            StatusCode        = $RawStatusCode
+                            StatusDescription = ([System.Net.HttpStatusCode]$RawStatusCode).ToString()
+                            Content           = $Data
+                            Headers           = $RawHeaders
                         }
                         $nextURL = $null
                     } elseif ($CountOnly) {
@@ -107,7 +114,7 @@ function New-GraphGetRequest {
                         $NextURL = $null
                     } else {
 
-                        if (!$SkipValueExtraction -and $Data.PSObject.Properties.Name -contains 'value') { $data.value } else { $Data }
+                        if (!$SkipValueExtraction -and $null -ne $Data -and $null -ne $Data.PSObject.Properties['value']) { $data.value } else { $Data }
                         if ($noPagination -eq $true) {
                             if ($Caller -eq 'Get-GraphRequestList' -and $data.'@odata.nextLink') {
                                 @{ 'nextLink' = $data.'@odata.nextLink' }
@@ -148,11 +155,13 @@ function New-GraphGetRequest {
                         }
                     }
 
+                    # A network failure has no response to read Retry-After from, and the header may be a date, not seconds
+                    $RetryAfter = if ($_.Exception.Response) { $_.Exception.Response.Headers['Retry-After'] -as [int] }
+
                     # Check for 429 Too Many Requests
                     if ($_.Exception.Response.StatusCode -eq 429) {
-                        $RetryAfterHeader = $_.Exception.Response.Headers['Retry-After']
-                        if ($RetryAfterHeader) {
-                            $WaitTime = [int]$RetryAfterHeader
+                        if ($RetryAfter) {
+                            $WaitTime = $RetryAfter
                             Write-Warning "Rate limited (429). Waiting $WaitTime seconds before retry. Attempt $($RetryCount + 1) of $MaxRetries"
                             $ShouldRetry = $true
                         } else {
@@ -162,10 +171,11 @@ function New-GraphGetRequest {
                             $ShouldRetry = $true
                         }
                     }
-                    # Check for "Resource temporarily unavailable"
-                    elseif ($Message -like '*Resource temporarily unavailable*' -or $Message -like '*Too many requests*') {
+                    # 503 (SharePoint's internal busy signal) and "Resource temporarily unavailable" / SharePoint CSOM throttling
+                    # ("Server busy, please retry" is transient and safe to retry).
+                    elseif ($_.Exception.Response.StatusCode -eq 503 -or $Message -like '*Resource temporarily unavailable*' -or $Message -like '*Too many requests*' -or $Message -like '*Server busy*') {
                         if ($RetryCount -lt $MaxRetries) {
-                            $WaitTime = Get-Random -Minimum 1.1 -Maximum 3.1  # Random sleep between 1-2 seconds
+                            $WaitTime = $RetryAfter ? $RetryAfter : (Get-Random -Minimum 1.1 -Maximum 3.1)  # Random sleep between 1-2 seconds
                             Write-Warning "Resource temporarily unavailable. Waiting $WaitTime seconds before retry. Attempt $($RetryCount + 1) of $MaxRetries"
                             $ShouldRetry = $true
                         }
@@ -180,8 +190,15 @@ function New-GraphGetRequest {
                 }
             } while (-not $RequestSuccessful -and $RetryCount -le $MaxRetries)
         } until ([string]::IsNullOrEmpty($NextURL) -or $NextURL -is [object[]] -or ' ' -eq $NextURL)
-        return $ReturnedData
+        }
+
+        if ($Stream) {
+            & $Pager
+        } else {
+            $ReturnedData = & $Pager
+            return $ReturnedData
+        }
     } else {
-        Write-Error 'Not allowed. You cannot manage your own tenant or tenants not under your scope'
+        Write-Error (Get-AuthorisedRequestError -TenantID $tenantid -Context 'Graph request')
     }
 }

@@ -74,7 +74,9 @@ function Add-CIPPW32ScriptApplication {
     # Build detection rules — detection script takes priority, then file detection, then marker file fallback
     if ($Properties.detectionScript) {
         # PowerShell script detection: script should write to STDOUT and exit 0 when detected
-        $DetectionScriptContent = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Properties.detectionScript))
+        # Resolve %tenantid%/%tenantfilter%/etc. for consistency with the install/uninstall scripts below
+        $ReplacedDetectionScript = Get-CIPPTextReplacement -Text $Properties.detectionScript -TenantFilter $TenantFilter
+        $DetectionScriptContent = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($ReplacedDetectionScript))
         $DetectionRules = @(
             @{
                 '@odata.type'         = '#microsoft.graph.win32LobAppPowerShellScriptDetection'
@@ -154,7 +156,7 @@ function Add-CIPPW32ScriptApplication {
     Start-Sleep -Milliseconds 200
 
     # Upload the Chocolatey intunewin content
-    Add-CIPPWin32LobAppContent -AppId $NewApp.id -FilePath $IntuneWinFile -FileName $FileName -UnencryptedSize $UnencryptedSize -EncryptionInfo $EncryptionInfo -TenantFilter $TenantFilter
+    $null = Add-CIPPWin32LobAppContent -AppId $NewApp.id -FilePath $IntuneWinFile -FileName $FileName -UnencryptedSize $UnencryptedSize -EncryptionInfo $EncryptionInfo -TenantFilter $TenantFilter
 
     # Upload PowerShell scripts via the scripts endpoint (newer method)
     $InstallScriptId = $null

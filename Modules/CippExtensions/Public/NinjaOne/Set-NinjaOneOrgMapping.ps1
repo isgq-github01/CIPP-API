@@ -7,7 +7,7 @@ function Set-NinjaOneOrgMapping {
     )
 
     Get-CIPPAzDataTableEntity @CIPPMapping -Filter "PartitionKey eq 'NinjaOneMapping'" | ForEach-Object {
-        Remove-AzDataTableEntity -Force @CIPPMapping -Entity $_
+        Remove-CIPPAzDataTableEntity -Force @CIPPMapping -Entity $_
     }
     foreach ($Mapping in $Request.Body) {
         if ($Mapping.TenantId) {
@@ -16,6 +16,7 @@ function Set-NinjaOneOrgMapping {
                 RowKey          = "$($mapping.TenantId)"
                 IntegrationId   = "$($mapping.IntegrationId)"
                 IntegrationName = "$($mapping.IntegrationName)"
+                SyncPasswords   = [bool]($Mapping.SyncPasswords ?? $true)
             }
         }
         Add-CIPPAzDataTableEntity @CIPPMapping -Entity $AddObject -Force

@@ -14,6 +14,7 @@ function Get-CIPPSchedulerBlockedCommands {
         # Token & authentication functions - would exfiltrate access/refresh tokens
         'Get-GraphToken'
         'Get-GraphTokenFromCert'
+        'New-CIPPCertificateAssertion'
         'Get-ClassicAPIToken'
         'Get-CIPPAzIdentityToken'
         'Get-CIPPAuthentication'
@@ -22,6 +23,18 @@ function Get-CIPPSchedulerBlockedCommands {
         'New-GraphGetRequest'
         'New-GraphBulkRequest'
         'New-ExoRequest'
+        'New-ExoBulkRequest'
+        'New-TeamsRequestV2'
+        'New-ClassicAPIGetRequest'
+        'Invoke-CIPPRestMethod'
+        'Invoke-GitHubApiRequest'
+        'New-CIPPAzStorageRequest'
+        'New-CippCoreRequest'
+        'New-CIPPDbRequest'
+        'New-DeviceLogin'
+        'Clear-CippTokenCache'
+        'Remove-CIPPDirectTenantToken'
+        'Remove-CIPPPartnerTenant'
 
         # Env
         'Set-CIPPEnvVarBackup'
@@ -30,24 +43,69 @@ function Get-CIPPSchedulerBlockedCommands {
         'Get-CIPPAzFunctionAppSetting'
         'Get-CIPPAzFunctionAppSubId'
         'Update-CIPPAzFunctionAppSetting'
+        'New-CIPPAzRestRequest'
 
         # Extension authentication tokens
         'Get-GradientToken'
         'Get-HaloToken'
+        'Invoke-SyncroRequest'
         'Get-NinjaOneToken'
+        'Get-NinjaOneUserToken'
+        'Invoke-NinjaOneDeviceWebhook'
         'Get-SherwebAuthentication'
+        'Invoke-ExternalCSPRequest'
         'Get-HIBPAuth'
 
         # Secret & key material
         'Get-CippKeyVaultSecret'
         'Set-CippKeyVaultSecret'
         'Remove-CippKeyVaultSecret'
+        'Get-CIPPSAMCertificate'
+        'Get-CIPPSAMCertificateVersions'
+        'New-CIPPSAMCertificate'
+        'Set-CIPPSAMCertificate'
+        'Update-CIPPSAMCertificate'
+        'ConvertTo-CIPPSAMCertificateInfo'
+        'Update-CIPPSAMSecret'
+        'Set-CIPPSAMCredentialRecord'
         'Get-ExtensionAPIKey'
         'Set-ExtensionAPIKey'
         'Remove-ExtensionAPIKey'
+        'Get-CIPPOmaSettingDecryptedValue'
+        'Get-CIPPVapidKeys'
+
+        # End-tenant secret material - recovery keys & admin passwords, PostExecution would exfiltrate them
+        'Get-CIPPLAPSPassword'
+        'Get-CIPPMacOSLapsPassword'
+        'Get-CIPPBitlockerKey'
+        'Search-CIPPBitlockerKeys'
+        'Get-CIPPFileVaultKey'
+        'Get-CIPPBiosPassword'
+
+        # SAM/CPV & app registration configuration - privilege escalation / token theft vectors
+        'Set-CIPPCPVConsent'
+        'Add-CIPPApplicationPermission'
+        'Add-CIPPDelegatedPermission'
+        'Update-CippSamPermissions'
+        'Set-CIPPSAMAdminRoles'
+        'Update-CIPPSAMRedirectUri'
+        'Update-CIPPSAMCertificateEnvCache'
+        'Add-CIPPSSOAppSecret'
+        'Set-CIPPSSOEasyAuth'
+        'Set-CIPPSSOStoredCredentials'
+        'Update-CIPPSSORedirectUri'
+        'New-CIPPAPIConfig'
+        'Get-CippApiAuth'
+        'Set-CippApiAuth'
+        'Repair-CippApiIdentifierUri'
+
+        # CIPP RBAC - would allow privilege escalation within CIPP
+        'Get-CIPPAccessRole'
+        'Set-CIPPAccessRole'
 
         # Tenant enumeration - would reveal full tenant list
         'Get-Tenants'
+        'Get-CIPPPartnerTenantList'
 
         # SAM permission enumeration - exposes which permissions the SAM app holds
         'Get-CippSamPermissions'
@@ -61,8 +119,26 @@ function Get-CIPPSchedulerBlockedCommands {
         'Add-CIPPAzDataTableEntity'
         'Add-AzDataTableEntity'
         'Update-AzDataTableEntity'
-        'Remove-AzDataTableEntity'
+        'Remove-CIPPAzDataTableEntity'
         'Remove-AzDataTable'
+        'Get-CIPPAzStorageContainer'
+        'Remove-CIPPAzStorageContainer'
+        'Get-CIPPAzStorageQueue'
+        'Get-CIPPAzStorageQueueMessage'
+        'Get-CIPPAzStorageQueueAnalysis'
+        'Clear-CIPPAzStorageQueue'
+
+        # Reporting-cache helpers - free table, partition and row key parameters reach other tenants and tables
+        'Add-CIPPDbItem'
+        'Get-CIPPDbItem'
+        'Get-CIPPDbItemPage'
+        'Update-CIPPDbItem'
+        'Remove-CIPPDbItem'
+        'Clear-CIPPDbCache'
+        'Push-CIPPBackupReplication'
+
+        # Infrastructure control - denial of service
+        'Request-CIPPRestart'
 
         # Backup & restore
         'Get-CIPPBackup'
@@ -72,5 +148,26 @@ function Get-CIPPSchedulerBlockedCommands {
         'New-CippQueueEntry'
         'Set-CippQueueTask'
         'Update-CippQueueEntry'
+        'Add-CIPPScheduledTask'
+
+        # Dispatchers - run a second command or a script taken from their own parameters
+        'Push-TableCleanupTask'
+        'Push-CIPPOffboardingTask'
+        'Push-ExecScheduledCommand'
+        'Start-CIPPOrchestrator'
+        'Invoke-CippSandboxScript'
+        'New-CippCustomScriptExecution'
+
+        # SAM credentials & notification routing
+        'Get-CIPPSAMCredentials'
+        'Set-CIPPNotificationConfig'
+
+        # Graph helpers with no tenant check or a caller-supplied URL.
+        # New-CIPPGraphRetry stays schedulable: the request helper schedules it itself.
+        'New-GraphMultiTenantBulkRequest'
+        'New-GraphDeltaQuery'
+        'New-CIPPMFAConnectorToken'
+        'Get-CIPPIntuneReportRows'
+        'Get-CIPPAuditLogContent'
     )
 }

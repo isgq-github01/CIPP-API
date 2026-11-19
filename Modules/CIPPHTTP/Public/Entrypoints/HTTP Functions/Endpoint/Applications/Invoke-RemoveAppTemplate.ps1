@@ -8,6 +8,10 @@ function Invoke-RemoveAppTemplate {
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
 
+    if (-not (Test-CippTemplateWriteAccess)) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::Forbidden; Body = @{ Results = 'Roles limited to specific tenants cannot change or remove shared templates.' } })
+    }
+
     $APIName = $Request.Params.CIPPEndpoint
     $Headers = $Request.Headers
 
@@ -20,7 +24,9 @@ function Invoke-RemoveAppTemplate {
         $Filter = "PartitionKey eq 'AppTemplate' and RowKey eq '$SafeID'"
         $Entity = Get-CIPPAzDataTableEntity @Table -Filter $Filter
         if ($Entity) {
-            Remove-AzDataTableEntity @Table -Entity $Entity
+            Remove-CIPPAzDataTableEntity @Table -Entity $Entity
+            $PackageIds = [regex]::Matches([string]$Entity.JSON, 'packageId\\?"\s*:\s*\\?"([0-9a-fA-F-]{36})').ForEach({ $_.Groups[1].Value })
+            Remove-CIPPUnusedAppPackage -PackageIds $PackageIds
             $Result = 'Successfully removed app template'
             Write-LogMessage -headers $Headers -API $APIName -message "Removed app template $ID" -Sev 'Info'
         } else {
@@ -29,7 +35,7 @@ function Invoke-RemoveAppTemplate {
         $StatusCode = [HttpStatusCode]::OK
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
-        $Result = "Failed to remove app template: $($ErrorMessage.NormalizedMessage)"
+        $Result = "Failed to remove app template: $($ErrorMessage.NormalizedError)"
         Write-LogMessage -headers $Headers -API $APIName -message $Result -Sev 'Error' -LogData $ErrorMessage
         $StatusCode = [HttpStatusCode]::InternalServerError
     }

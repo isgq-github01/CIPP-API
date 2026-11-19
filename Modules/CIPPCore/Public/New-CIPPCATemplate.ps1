@@ -76,7 +76,7 @@ function New-CIPPCATemplate {
     if ($isPSCustomObject -and $hasIncludeUsers) {
         $JSON.conditions.users.includeUsers = @($JSON.conditions.users.includeUsers | ForEach-Object {
                 $originalID = $_
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers') { return $_ }
+                if ($_ -in 'All', 'None', 'GuestsOrExternalUsers') { return $_ }
                 $match = $users | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
             })
@@ -85,7 +85,7 @@ function New-CIPPCATemplate {
     # Use the same type check for other user properties
     if ($isPSCustomObject -and $null -ne $JSON.conditions.users.excludeUsers) {
         $JSON.conditions.users.excludeUsers = @($JSON.conditions.users.excludeUsers | ForEach-Object {
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers') { return $_ }
+                if ($_ -in 'All', 'None', 'GuestsOrExternalUsers') { return $_ }
                 $originalID = $_
                 $match = $users | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
@@ -95,7 +95,7 @@ function New-CIPPCATemplate {
     if ($isPSCustomObject -and $null -ne $JSON.conditions.users.includeGroups) {
         $JSON.conditions.users.includeGroups = @($JSON.conditions.users.includeGroups | ForEach-Object {
                 $originalID = $_
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
+                if ($_ -in 'All', 'None', 'GuestsOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
                 $match = $groups | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
             })
@@ -103,7 +103,7 @@ function New-CIPPCATemplate {
     if ($isPSCustomObject -and $null -ne $JSON.conditions.users.excludeGroups) {
         $JSON.conditions.users.excludeGroups = @($JSON.conditions.users.excludeGroups | ForEach-Object {
                 $originalID = $_
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
+                if ($_ -in 'All', 'None', 'GuestsOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
                 $match = $groups | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
             })
@@ -135,6 +135,15 @@ function New-CIPPCATemplate {
         }
         $JSON.conditions.applications.includeAuthenticationContextClassReferences = @($authContextDisplayNames)
         $JSON | Add-Member -NotePropertyName 'AuthContextInfo' -NotePropertyValue @($AllAuthContexts) -Force
+    }
+
+    $GsaControl = $JSON.sessionControls.globalSecureAccessFilteringProfile
+    if ($GsaControl) {
+        $JSON.sessionControls.PSObject.Properties.Remove('networkAccessSecurity')
+        if ($GsaControl.profileId -is [string] -and (Test-IsGuid -String $GsaControl.profileId)) {
+            $GsaProfile = try { New-GraphGetRequest -uri "https://graph.microsoft.com/beta/networkAccess/filteringProfiles/$($GsaControl.profileId)" -tenantid $TenantFilter -AsApp $true } catch { $null }
+            if ($GsaProfile.name) { $GsaControl.profileId = $GsaProfile.name }
+        }
     }
 
     $JSON = (ConvertTo-Json -Compress -Depth 100 -InputObject $JSON)

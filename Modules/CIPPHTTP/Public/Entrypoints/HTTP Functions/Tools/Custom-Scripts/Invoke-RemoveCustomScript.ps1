@@ -15,16 +15,18 @@ function Invoke-RemoveCustomScript {
         $ScriptGuid = $Request.Query.ScriptGuid ?? $Request.Body.ScriptGuid
 
         if ([string]::IsNullOrWhiteSpace($ScriptGuid)) {
+            $FailCode = [HttpStatusCode]::BadRequest
             throw 'ScriptGuid is required'
         }
 
         $Table = Get-CippTable -tablename 'CustomPowershellScripts'
 
         # Actually delete all versions of the script
-        $Filter = "PartitionKey eq 'CustomScript' and ScriptGuid eq '{0}'" -f $ScriptGuid
+        $Filter = "PartitionKey eq 'CustomScript' and ScriptGuid eq '{0}'" -f (ConvertTo-CIPPODataFilterValue -Value $ScriptGuid)
         $Scripts = Get-CIPPAzDataTableEntity @Table -Filter $Filter
 
         if (-not $Scripts) {
+            $FailCode = [HttpStatusCode]::NotFound
             throw "Script with GUID '$ScriptGuid' not found"
         }
 
@@ -33,16 +35,16 @@ function Invoke-RemoveCustomScript {
 
         # Delete all versions
         foreach ($script in $Scripts) {
-            Remove-AzDataTableEntity @Table -Entity $script
+            Remove-CIPPAzDataTableEntity @Table -Entity $script
         }
 
         # Delete matching test result rows for this custom script across tenants
         $CustomTestId = "CustomScript-$ScriptGuid"
         $TestResultsTable = Get-CippTable -tablename 'CippTestResults'
-        $TestResultsFilter = "RowKey eq '{0}'" -f $CustomTestId
+        $TestResultsFilter = "RowKey eq '{0}'" -f (ConvertTo-CIPPODataFilterValue -Value $CustomTestId)
         $RelatedTestResults = @(Get-CIPPAzDataTableEntity @TestResultsTable -Filter $TestResultsFilter)
         foreach ($ResultRow in $RelatedTestResults) {
-            Remove-AzDataTableEntity @TestResultsTable -Entity $ResultRow
+            Remove-CIPPAzDataTableEntity @TestResultsTable -Entity $ResultRow
         }
 
         # Remove this custom test from any custom report templates that include it
@@ -85,7 +87,7 @@ function Invoke-RemoveCustomScript {
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API $APIName -headers $Headers -message "Failed to remove custom script: $($ErrorMessage.NormalizedError)" -sev 'Error' -LogData $ErrorMessage
-        $StatusCode = [HttpStatusCode]::BadRequest
+        $StatusCode = $FailCode ?? [HttpStatusCode]::InternalServerError
         $Body = @{ Error = $ErrorMessage.NormalizedError }
     }
 

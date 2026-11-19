@@ -1,7 +1,9 @@
 function Sync-CIPPReusablePolicySettings {
     param(
         [psobject]$TemplateInfo,
-        [string]$Tenant
+        [string]$Tenant,
+        # Map the tenant's existing settings by name without creating or updating any
+        [switch]$ReadOnly
     )
 
     $result = [pscustomobject]@{
@@ -12,7 +14,8 @@ function Sync-CIPPReusablePolicySettings {
     $reusableRefs = @($TemplateInfo.ReusableSettings)
     if (-not $reusableRefs) { return $result }
 
-    $existingReusableSettings = New-GraphGETRequest -Uri 'https://graph.microsoft.com/beta/deviceManagement/reusablePolicySettings?$top=999' -tenantid $Tenant
+    # The list endpoint omits settingInstance unless explicitly selected, which would make every compare fail
+    $existingReusableSettings = New-GraphGETRequest -Uri 'https://graph.microsoft.com/beta/deviceManagement/reusablePolicySettings?$top=999&$select=id,displayName,description,settingDefinitionId,settingInstance,version' -tenantid $Tenant
     $table = Get-CippTable -tablename 'templates'
     $templateEntities = Get-CIPPAzDataTableEntity @table -Filter "PartitionKey eq 'IntuneReusableSettingTemplate'"
 
@@ -51,7 +54,7 @@ function Sync-CIPPReusablePolicySettings {
             $needsUpdate = $true
         }
 
-        if ($needsUpdate) {
+        if ($needsUpdate -and -not $ReadOnly) {
             try {
                 if ($targetId) {
                     $updated = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/deviceManagement/reusablePolicySettings/$targetId" -tenantid $Tenant -type PUT -body $templateRaw
